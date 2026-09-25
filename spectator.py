@@ -1,61 +1,78 @@
 """
-Spectator Learning — Section 13
-================================
-"Folding does not terminate information gathering."
+Spectator Learning  (design doc §15, §25)
+=========================================
+Folding does not stop information gathering: every observable hand —
+played, folded preflop, folded later, or contested only by others — updates
+the opponent models.
 
-Processes every hand the bot observes — whether it played, folded
-preflop, or folded on a later street — and extracts training data
-for opponent models.
+    D_t = {positions, actions, sizes, board, showdown, outcome}   (Eq. 28)
+    M_i^(t+1) = U(M_i^(t), D_t)
+    IG(D) = H(M_i) − H(M_i | D)                                   (Eq. 39)
 
-Equation 47:  D_t = {positions, actions, sizes, board, showdown, outcome}
-Equation 48:  M_i^{t+1} = U(M_i^t, D_t)
-Equation 81:  IG(D) = H(M_i) - H(M_i | D)
+Fixes relative to the original code:
 
-Information sources ranked by value:
-  1. Showdown reveals (we SEE their cards — ground truth)
-  2. Actions in hands we're still in (real-time)
-  3. Actions in hands we've folded from (spectator)
-  4. Bet sizing patterns (always visible)
+* **Pre-action context.**  Observers receive an action after it has been
+  applied, so "was the player facing a bet / a raise?" and the pot they
+  faced must come from the Action's recorded pre-action fields.  The old
+  code read the post-action state: every preflop open-raise was logged as a
+  3-bet (the raiser "faced" its own raise), calls were logged as not facing
+  a bet, and sizes were divided by the wrong pot.
+* **VPIP / PFR are per-hand statistics** (one observation per player per
+  hand), not per action.
+* **Conditional cells.**  Every decision is recorded in the same
+  (decision type × street × position × texture × prior action) cell that
+  range inference reads from (§10.2).
+* **Fold-to-bet by size** is recorded with the size actually faced.
+* **Showdown ground truth.**  A revealed hand is replayed street by street:
+  its strength percentile at each decision feeds the size-given-strength
+  table (§12.3) and the threshold-consistency fingerprint (§14).  A bluff
+  is a bet/raise made with a hand in the bottom half of holdings on that
+  street — not "was aggressive and lost", which labelled every beaten value
+  bet a bluff.
+* **Information value (§25).**  The entropy drop of the type posterior is
+  recorded per showdown, and the most informative observations are kept.
 """
 
 from __future__ import annotations
+import heapq
 from dataclasses import dataclass, field
 from typing import Optional
 
 from game_state import GameState, Action, ActionType, Street
 from bot_interface import HandStartInfo, ShowdownInfo, HandEndInfo
-from hand_evaluator import evaluate, HandRank
-from opponent_model import OpponentModel, OpponentModelSet, PopulationPrior
+from hand_strength import hand_strength
+from opponent_model import (
+    OpponentModel, OpponentModelSet, PopulationPrior, decision_cell, action_kind,
+)
+
+BLUFF_STRENGTH = 0.50   # bets below this percentile count as bluffs
 
 
 # ---------------------------------------------------------------------------
-# Hand record (Section 22)
+# Hand record (§26)
 # ---------------------------------------------------------------------------
 @dataclass
 class HandRecord:
-    """
-    All observable data from one hand (Equation 47).
-    Built incrementally as actions and events arrive.
-    """
     hand_number: int = 0
     num_players: int = 2
     hero_seat: int = 0
     positions: list[str] = field(default_factory=list)
     board: list[int] = field(default_factory=list)
+    boards: dict[int, list[int]] = field(default_factory=dict)   # street → board
     pot: int = 0
+    stacks: list[int] = field(default_factory=list)
 
-    # Per-player data
     hole_cards: dict[int, list[int]] = field(default_factory=dict)
     actions: list[Action] = field(default_factory=list)
 
-    # Tracking who did what preflop
-    preflop_raiser: int = -1   # seat of last preflop raiser
+    preflop_raiser: int = -1
     preflop_voluntary: set = field(default_factory=set)
+    # per-seat preflop summary: seat → dict(vpip, pfr, faced_raise, three_bet, first)
+    preflop: dict = field(default_factory=dict)
+    # aggressor of each street (last player to bet/raise)
+    street_aggressor: dict[int, int] = field(default_factory=dict)
+    acted_on_street: dict[int, set] = field(default_factory=dict)
 
-    # Per-street pot snapshots (for bet-size ratios)
-    pot_at_street: dict[int, int] = field(default_factory=dict)
-
-    # Showdown
     went_to_showdown: bool = False
     showdown_cards: dict[int, list[int]] = field(default_factory=dict)
     winners: list[int] = field(default_factory=list)
@@ -65,216 +82,206 @@ class HandRecord:
 # Spectator Learner
 # ---------------------------------------------------------------------------
 class SpectatorLearner:
-    """
-    Observes all hands and updates opponent models.
-
-    Wired into the BaseBot observation hooks:
-      - on_hand_start()     → reset hand record
-      - on_action()         → extract stats from each action
-      - on_board()          → track street transitions
-      - on_showdown()       → ground-truth opponent cards
-      - on_hand_end()       → finalize and commit updates
-
-    The hero's own actions are skipped for opponent modeling.
-    """
+    """Observes every hand and updates opponent models (hero's own actions skipped)."""
 
     def __init__(self, hero_seat: int = -1,
-                 prior: Optional[PopulationPrior] = None):
+                 prior: Optional[PopulationPrior] = None,
+                 keep_top_observations: int = 50):
         self.hero_seat = hero_seat
         self.models = OpponentModelSet(prior)
         self._record: Optional[HandRecord] = None
-        self._current_pot: int = 0
         self._hero_folded: bool = False
 
-        # Stats
         self.hands_processed: int = 0
         self.showdowns_observed: int = 0
-        self.spectator_hands: int = 0  # hands learned from after folding
+        self.spectator_hands: int = 0          # hands learned from after folding
+        self.spectator_showdowns: int = 0      # showdowns seen after hero folded
+
+        # §25 information value bookkeeping
+        self.information_gain_total: float = 0.0
+        self._keep = keep_top_observations
+        self._top_observations: list[tuple[float, int, int]] = []   # min-heap
 
     # ------------------------------------------------------------------
-    # Hook: hand start
+    # Hooks
     # ------------------------------------------------------------------
     def on_hand_start(self, info: HandStartInfo):
         self.hero_seat = info.seat
         self._hero_folded = False
-        self._current_pot = info.small_blind + info.big_blind
-
         self._record = HandRecord(
             hand_number=info.hand_number,
             num_players=info.num_players,
             hero_seat=info.seat,
             positions=list(info.positions),
+            stacks=list(info.stacks),
         )
         self._record.hole_cards[info.seat] = list(info.hole_cards)
-        self._record.pot_at_street[Street.PREFLOP] = self._current_pot
+        self._record.boards[0] = []
 
-    # ------------------------------------------------------------------
-    # Hook: action observed
-    # ------------------------------------------------------------------
-    def on_action(self, action: Action, game_state: GameState):
-        if self._record is None:
+    def on_action(self, action: Action, game_state: Optional[GameState] = None):
+        rec = self._record
+        if rec is None:
             return
+        rec.actions.append(action)
+        p = action.player
+        street = int(action.street)
+        rec.acted_on_street.setdefault(street, set())
+        first_on_street = p not in rec.acted_on_street[street]
+        rec.acted_on_street[street].add(p)
 
-        self._record.actions.append(action)
-        player = action.player
-        self._current_pot = game_state.pot
+        aggressive = action.is_aggressive
+        prev_aggressor = rec.street_aggressor.get(street - 1) if street > 0 else None
+        if aggressive:
+            rec.street_aggressor[street] = p
+            if street == 0:
+                rec.preflop_raiser = p
 
-        # Skip hero's own actions for opponent modeling
-        if player == self.hero_seat:
+        if p == self.hero_seat:
             if action.action_type == ActionType.FOLD:
                 self._hero_folded = True
             return
 
-        model = self.models.get(player)
-        position = (self._record.positions[player]
-                    if player < len(self._record.positions) else "?")
+        model = self.models.get(p)
+        position = rec.positions[p] if p < len(rec.positions) else "MP"
+        facing = action.to_call > 0
+        kind = action_kind(action.action_type, aggressive, facing)
 
-        if action.street == Street.PREFLOP:
-            self._process_preflop_action(model, action, game_state, position)
-        else:
-            self._process_postflop_action(model, action, game_state)
+        if street == 0:
+            self._preflop(model, rec, action, position, kind)
+            return
 
-    def _process_preflop_action(self, model: OpponentModel, action: Action,
-                                gs: GameState, position: str):
-        """Extract preflop stats from one action."""
-        at = action.action_type
-        facing_raise = gs.max_current_bet > gs.big_blind
-        is_voluntary = at in (ActionType.CALL, ActionType.RAISE,
-                              ActionType.BET, ActionType.ALL_IN)
-        is_raise = at in (ActionType.RAISE, ActionType.BET, ActionType.ALL_IN)
-
-        model.record_preflop_action(
-            action_type=at,
-            position=position,
-            is_voluntary=is_voluntary,
-            is_raise=is_raise,
-            facing_raise=facing_raise,
-        )
-
-        if is_raise:
-            self._record.preflop_raiser = action.player
-        if is_voluntary:
-            self._record.preflop_voluntary.add(action.player)
-
-    def _process_postflop_action(self, model: OpponentModel, action: Action,
-                                 gs: GameState):
-        """Extract post-flop stats from one action."""
-        at = action.action_type
-        street = action.street
-
-        # Track pot at each new street
-        if street not in self._record.pot_at_street:
-            self._record.pot_at_street[street] = self._current_pot
-
-        pot_before = self._record.pot_at_street.get(street, self._current_pot)
-
-        # Determine if this player was the preflop aggressor
-        is_aggressor = action.player == self._record.preflop_raiser
-
-        # Determine what they're facing
-        facing_bet = gs.max_current_bet > gs.current_bets[action.player]
-        facing_raise = facing_bet and any(
-            a.action_type in (ActionType.RAISE, ActionType.ALL_IN)
-            for a in self._record.actions
-            if a.street == street and a.player != action.player
-        )
-
-        # Compute bet amount relative to pot
-        bet_amount = 0
-        if at in (ActionType.BET, ActionType.RAISE, ActionType.ALL_IN):
-            bet_amount = action.amount - gs.current_bets.get(action.player, 0) \
-                if hasattr(gs.current_bets, 'get') else action.amount
-
+        board = rec.boards.get(street, rec.board)
+        was_agg = prev_aggressor == p
+        decision, cell = decision_cell(street, position, board, was_agg, facing,
+                                       action.raises_before)
+        denom = action.pot_before - action.to_call
+        faced = (action.to_call / denom) if (facing and denom > 0) else None
+        size = action.size_fraction if aggressive else faced
+        cbet_opp = (was_agg and first_on_street and not facing
+                    and action.raises_before == 0)
         model.record_postflop_action(
-            action_type=at,
+            action_type=action.action_type,
             street=street,
-            bet_amount=bet_amount,
-            pot_before=pot_before,
-            is_aggressor=is_aggressor,
-            facing_bet=facing_bet,
-            facing_raise=facing_raise,
+            bet_amount=max(0, action.amount - action.bet_before) if aggressive else action.to_call,
+            pot_before=action.pot_before,
+            is_aggressor=was_agg,
+            facing_bet=facing,
+            facing_raise=action.raises_before >= 2,
+            size_fraction=size,
+            cell=cell,
+            cbet_opportunity=cbet_opp,
         )
 
-    # ------------------------------------------------------------------
-    # Hook: board dealt
-    # ------------------------------------------------------------------
+    def _preflop(self, model: OpponentModel, rec: HandRecord, action: Action,
+                 position: str, kind: str):
+        decision, cell = decision_cell(0, position, [], False, action.to_call > 0,
+                                       action.raises_before)
+        if kind == "bet":
+            kind = "raise"
+        if kind == "check":
+            kind = "call"          # BB option: stayed in without raising
+        model.record_preflop_decision((decision,) + cell, kind)
+
+        st = rec.preflop.setdefault(action.player, {
+            "vpip": False, "pfr": False, "faced_raise": False,
+            "three_bet": False, "first": None, "position": position})
+        if st["first"] is None:
+            st["first"] = kind
+        if action.raises_before >= 1:
+            st["faced_raise"] = True
+        if action.action_type in (ActionType.CALL, ActionType.RAISE,
+                                  ActionType.BET, ActionType.ALL_IN):
+            st["vpip"] = True
+            rec.preflop_voluntary.add(action.player)
+        if action.is_aggressive:
+            st["pfr"] = True
+            if action.raises_before >= 1:
+                st["three_bet"] = True
+
     def on_board(self, street: Street, board: list[int]):
         if self._record is not None:
             self._record.board = list(board)
-            self._record.pot_at_street[street] = self._current_pot
+            self._record.boards[int(street)] = list(board)
 
-    # ------------------------------------------------------------------
-    # Hook: showdown
-    # ------------------------------------------------------------------
     def on_showdown(self, info: ShowdownInfo):
-        if self._record is None:
+        rec = self._record
+        if rec is None:
             return
-
-        self._record.went_to_showdown = True
-        self._record.showdown_cards = dict(info.revealed_cards)
-        self._record.winners = list(info.winners)
-        self._record.board = list(info.board)
+        rec.went_to_showdown = True
+        rec.showdown_cards = dict(info.revealed_cards)
+        rec.winners = list(info.winners)
+        rec.board = list(info.board)
         self.showdowns_observed += 1
+        if self._hero_folded:
+            self.spectator_showdowns += 1
 
-        # Process showdown results for each revealed opponent
         for seat, cards in info.revealed_cards.items():
             if seat == self.hero_seat:
                 continue
-
             model = self.models.get(seat)
-            won = seat in info.winners
+            h_before = model.type_entropy()
+            was_bluffing = self._replay_showdown(model, seat, cards, info.board)
+            model.record_showdown(won=seat in info.winners, was_bluffing=was_bluffing)
+            ig = h_before - model.type_entropy()
+            self._log_information(ig, rec.hand_number, seat)
 
-            # Determine if the opponent was bluffing at showdown
-            # A "bluff" = they were betting/raising with a losing hand
-            was_bluffing = self._detect_bluff(seat, cards, info)
-            model.record_showdown(won=won, was_bluffing=was_bluffing)
+    def _board_at(self, street: int, final_board: list[int]) -> list[int]:
+        n = {1: 3, 2: 4, 3: 5}.get(street, 0)
+        return list(final_board[:n])
 
-    def _detect_bluff(self, seat: int, cards: list[int],
-                      info: ShowdownInfo) -> Optional[bool]:
+    def _replay_showdown(self, model: OpponentModel, seat: int,
+                         cards: list[int], final_board: list[int]) -> Optional[bool]:
+        """Walk the revealed player's postflop actions with ground truth.
+
+        Returns whether their last aggressive action was a bluff (None if
+        they never bet or raised postflop).
         """
-        Determine if the opponent was bluffing.
-        A bluff = they were the aggressor (bet/raised) and lost.
-
-        This is the high-value observation from Section 21 (Equation 82):
-            P(bluff | river, board, sizing, history)
-        """
-        if not self._record or not self._record.actions:
+        last_aggr_strength = None
+        for a in self._record.actions:
+            if a.player != seat or a.street == Street.PREFLOP:
+                continue
+            board = self._board_at(int(a.street), final_board)
+            if len(board) < 3:
+                continue
+            s = hand_strength(cards, board)
+            model.record_showdown_action(int(a.street), s, a.is_aggressive,
+                                         a.to_call > 0,
+                                         a.size_fraction if a.is_aggressive else None)
+            if a.is_aggressive:
+                last_aggr_strength = s
+        if last_aggr_strength is None:
             return None
+        return last_aggr_strength < BLUFF_STRENGTH
 
-        # Check if they were betting/raising in the last street before showdown
-        last_street_actions = [
-            a for a in self._record.actions
-            if a.player == seat and a.action_type in (
-                ActionType.BET, ActionType.RAISE, ActionType.ALL_IN
-            )
-        ]
+    def _log_information(self, ig: float, hand_number: int, seat: int):
+        self.information_gain_total += max(0.0, ig)
+        item = (ig, hand_number, seat)
+        if len(self._top_observations) < self._keep:
+            heapq.heappush(self._top_observations, item)
+        elif ig > self._top_observations[0][0]:
+            heapq.heapreplace(self._top_observations, item)
 
-        if not last_street_actions:
-            return None  # they were passive — can't determine bluff
-
-        # They were aggressive — did they lose?
-        was_aggressor = len(last_street_actions) > 0
-        lost = seat not in info.winners
-
-        return was_aggressor and lost
-
-    # ------------------------------------------------------------------
-    # Hook: hand end
-    # ------------------------------------------------------------------
     def on_hand_end(self, info: HandEndInfo):
-        if self._record is None:
+        rec = self._record
+        if rec is None:
             return
-
-        # Finalize all opponent models for this hand
-        for seat in range(self._record.num_players):
+        for seat, st in rec.preflop.items():
             if seat == self.hero_seat:
                 continue
-            model = self.models.get(seat)
-            model.finish_hand()
+            self.models.get(seat).record_preflop_hand(
+                st["position"], st["vpip"], st["pfr"], st["faced_raise"],
+                st["three_bet"], st["first"])
+        for seat in range(rec.num_players):
+            if seat == self.hero_seat:
+                continue
+            if rec.stacks and seat < len(rec.stacks) and rec.stacks[seat] <= 0 \
+                    and seat not in rec.preflop:
+                continue        # sat out (busted)
+            self.models.get(seat).finish_hand()
+        self.models.on_hand_end()
 
         if self._hero_folded:
             self.spectator_hands += 1
-
         self.hands_processed += 1
         self._record = None
 
@@ -284,45 +291,36 @@ class SpectatorLearner:
     def get_model(self, player_id: int) -> OpponentModel:
         return self.models.get(player_id)
 
-    def get_fold_estimate(self, player_id: int,
-                          facing_raise: bool = False) -> float:
-        """
-        Get estimated fold probability for an opponent.
-        Uses individual model when confident, falls back to population prior.
-        """
+    def get_fold_estimate(self, player_id: int, facing_raise: bool = False,
+                          size_fraction: Optional[float] = None) -> float:
         model = self.models.get(player_id)
         if facing_raise:
             return model.estimated_fold_to_raise()
-        return model.estimated_fold_to_bet()
+        return model.estimated_fold_to_bet(size_fraction)
 
     def get_opponent_type(self, player_id: int) -> str:
         return self.models.get(player_id).primary_type()
 
-    def suggest_strategy(self, player_id: int) -> str:
-        """
-        Suggest an exploitative strategy mode based on opponent type.
-        Maps to the strategy modes from Section 18 (Equations 65-68).
-        """
-        model = self.models.get(player_id)
-        otype = model.primary_type()
+    def top_observations(self) -> list[tuple[float, int, int]]:
+        """Most informative showdowns so far: (IG bits, hand number, seat)."""
+        return sorted(self._top_observations, reverse=True)
 
-        # Section 18 mappings
-        if otype == "passive":
-            return "value_heavy"        # Equation 65: calling station → value
-        elif otype == "tight":
-            return "aggressive"         # Equation 66: nit → bluff-heavy
-        elif otype == "aggressive":
-            return "trap_heavy"         # Equation 67: maniac → trap
-        elif otype in ("balanced", "gto_like"):
-            return "balanced"           # Equation 68: balanced → balanced
-        else:
-            return "balanced"
+    def suggest_strategy(self, player_id: int) -> str:
+        """Behavioural mode label for an opponent (§21).
+
+        The actual exploitation is quantitative (MDF loop, exploiter.py);
+        this label is descriptive and used for reporting / hysteresis.
+        """
+        otype = self.models.get(player_id).primary_type()
+        return {"passive": "value_heavy", "tight": "aggressive",
+                "aggressive": "trap_heavy"}.get(otype, "balanced")
 
     def report(self) -> str:
         lines = [
             f"Spectator Learner: {self.hands_processed} hands processed, "
-            f"{self.showdowns_observed} showdowns, "
-            f"{self.spectator_hands} spectator hands",
+            f"{self.showdowns_observed} showdowns ({self.spectator_showdowns} after "
+            f"hero folded), {self.spectator_hands} spectator hands, "
+            f"IG={self.information_gain_total:.2f} bits",
+            self.models.report(),
         ]
-        lines.append(self.models.report())
         return "\n".join(lines)

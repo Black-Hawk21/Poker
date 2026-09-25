@@ -326,18 +326,22 @@ print(f"    RNG bot: cracked={rng_status['cracked']}, "
 print("\n═══ EDGE CASE: SEED NOT IN RANGE ═══")
 # ===================================================================
 
-print("\n  Game seed=999, analyzer max_seed=50 (seed outside range):")
-oracle_miss = OracleBot("OracleMiss", max_seed=50, rng_enabled=True, seed=1)
+print("\n  Game seed=999, analyzer max_seed=50, fallback OFF (uncrackable):")
+# With the expanded search enabled, seed 999 would be found (it is within the
+# default fallback window). This test targets the graceful path — cracking
+# disabled/exhausted — so the fallback is turned off and no seed survives.
+oracle_miss = OracleBot("OracleMiss", max_seed=50, rng_enabled=True, seed=1,
+                        fallback_enabled=False)
 station4 = CallingStation("Station", seed=2)
 runner_miss = GameRunner(
     bots=[oracle_miss, station4],
     starting_stack=1000, small_blind=5, big_blind=10,
-    deck_seed=999,  # outside [0, 50)
+    deck_seed=999,  # outside [0, 50), fallback off → unreachable
 )
 stats_miss = runner_miss.run(num_hands=20)
 
 miss_status = oracle_miss.analyzer_status()
-check("All candidates eliminated (seed not in range)",
+check("All candidates eliminated (seed not in range, fallback off)",
       miss_status['candidates_alive'] == 0,
       f"alive={miss_status['candidates_alive']}")
 check("Confidence is 0 (correctly uncertain)",
@@ -345,6 +349,20 @@ check("Confidence is 0 (correctly uncertain)",
       f"conf={miss_status['confidence']}")
 check("Bot still plays without crashing", stats_miss.total_hands == 20)
 print(f"    Oracle gracefully falls back to standard play")
+
+# And with the fallback ON, the same 'out of initial range' seed IS cracked.
+print("\n  Same game seed=999 with fallback ON → cracked via expanded search:")
+oracle_hit = OracleBot("OracleHit", max_seed=50, rng_enabled=True, seed=1,
+                       fallback_enabled=True, fallback_max_seed=5000)
+runner_hit = GameRunner(
+    bots=[oracle_hit, CallingStation("Station", seed=2)],
+    starting_stack=1000, small_blind=5, big_blind=10, deck_seed=999,
+)
+runner_hit.run(num_hands=20)
+hit_status = oracle_hit.analyzer_status()
+check("Fallback cracks the out-of-initial-range seed",
+      hit_status['best_seed'] == 999,
+      f"best={hit_status['best_seed']}")
 
 
 # ===================================================================

@@ -306,6 +306,103 @@ except Exception as e:
 
 
 # ===================================================================
+print("\n═══ SEED FALLBACK — CRACK A SEED OUTSIDE 0–999 ═══")
+# ===================================================================
+
+import random
+from deck import Deck
+from environment_model import (EnvironmentAnalyzer, HandObservation,
+                               MT19937Recovery)
+
+
+def _observe_seed(seed, n_hands):
+    d = Deck(seed=seed)
+    obs = []
+    for hi in range(n_hands):
+        d.reset()
+        a = d.deal(12)
+        obs.append(HandObservation(hi, 2, 0, [a[0], a[1]],
+                                   [a[5], a[6], a[7], a[9], a[11]],
+                                   {1: [a[2], a[3]]}))
+    return obs
+
+
+print("\n  True seed 45678 (initial window is only 0–999):")
+big_obs = _observe_seed(45678, 4)
+an = EnvironmentAnalyzer(max_seed=1000, fallback_max_seed=100_000,
+                         fallback_time_budget=30.0)
+an.observe(big_obs[0])
+check("Initial 0–999 window exhausted after hand 0", an.alive_count() <= 1)
+check("Fallback was triggered", an._fallback_triggered)
+check("Fallback cracked the out-of-window seed", an.best_seed == 45678,
+      f"best={an.best_seed}")
+for o in big_obs[1:]:
+    an.observe(o)
+check("Confident after fallback", an.is_confident)
+
+pred = an.predict_next_hand(2, 0)
+d = Deck(seed=45678)
+for _ in range(5):
+    d.reset()
+    a = d.deal(12)
+check("Fallback prediction matches actual next hand",
+      pred is not None
+      and pred["hero_cards"] == [a[0], a[1]]
+      and pred["board"] == [a[5], a[6], a[7], a[9], a[11]]
+      and pred["opponent_cards"][1] == [a[2], a[3]])
+
+print("\n  Seed beyond the fallback range → graceful, no false crack:")
+oor = _observe_seed(500_000, 3)
+an_oor = EnvironmentAnalyzer(max_seed=1000, fallback_max_seed=20_000,
+                            fallback_time_budget=10.0)
+for o in oor:
+    an_oor.observe(o)
+check("Out-of-range seed: 0 candidates, 0 confidence",
+      an_oor.alive_count() == 0 and an_oor.confidence == 0.0)
+check("Out-of-range seed: no prediction returned",
+      an_oor.predict_next_hand(2, 0) is None)
+
+
+# ===================================================================
+print("\n═══ MT19937 STATE RECOVERY — 624 OUTPUTS ═══")
+# ===================================================================
+
+def _temper(y):
+    y ^= y >> 11
+    y ^= (y << 7) & 0x9D2C5680
+    y ^= (y << 15) & 0xEFC60000
+    y ^= y >> 18
+    return y & 0xFFFFFFFF
+
+samples = [random.getrandbits(32) for _ in range(2000)]
+check("untemper is the exact inverse of MT tempering",
+      all(MT19937Recovery.untemper(_temper(v)) == v for v in samples))
+
+src = random.Random(2024)
+outs = [src.getrandbits(32) for _ in range(624)]
+recovered = MT19937Recovery.from_outputs(outs)
+check("State recovered from 624 outputs", recovered is not None)
+check("Recovered generator predicts next 300 words exactly",
+      all(recovered.getrandbits(32) == src.getrandbits(32) for _ in range(300)))
+
+check("from_outputs needs at least 624 words",
+      MT19937Recovery.from_outputs(outs[:600]) is None)
+
+# The untemper attack is for full-word-leaking arenas; a 52-card shuffle
+# leaks only the top ≤6 bits per word, so it is not recoverable this way.
+class _Counter(random.Random):
+    def __init__(self, seed):
+        super().__init__(seed); self.widths = []
+    def getrandbits(self, k):
+        self.widths.append(k); return super().getrandbits(k)
+
+cnt = _Counter(1)
+deck = list(range(52)); cnt.shuffle(deck)
+check("A 52-card shuffle leaks only ≤6-bit words (not untemperable)",
+      cnt.widths and max(cnt.widths) <= 6)
+
+
+# ===================================================================
 print(f"\n{'═'*60}")
 print(f"  Results: {passed} passed, {failed} failed")
 print(f"{'═'*60}\n")

@@ -8,7 +8,9 @@ Features:
   - Supports 2–9 players per table
   - Rotates dealer each hand
   - Full spectator-learning protocol: every bot sees showdown data
-  - Determines winners at showdown (including split pots)
+  - Determines winners at showdown, with side pots and split pots
+  - Bots receive a per-seat view: opponents' hole cards hidden
+  - Tournament mode (reset_stacks_each_hand=False) carries stacks over
   - Tracks VPIP/PFR per hand for stats
   - Configurable hand count, blind levels, starting stacks
   - Verbose or silent mode
@@ -29,6 +31,7 @@ Usage:
 """
 
 from __future__ import annotations
+import copy
 import sys
 from typing import Optional
 
@@ -93,18 +96,35 @@ class GameRunner:
         """
         tracker = StatsTracker(big_blind=self.big_blind)
         dealer = 0
+        self._gs.starting_stacks = [self.starting_stack] * self.num_players
 
         for hand_num in range(1, num_hands + 1):
             if reset_stacks_each_hand:
                 self._gs.starting_stacks = [self.starting_stack] * self.num_players
+            live = [i for i in range(self.num_players) if self._gs.starting_stacks[i] > 0]
+            if len(live) < 2:
+                break                       # tournament over
+            if self._gs.starting_stacks[dealer] <= 0:
+                dealer = self._next_live(dealer)
 
-            self._play_hand(hand_num, dealer, tracker)
-            dealer = (dealer + 1) % self.num_players
+            final = self._play_hand(hand_num, dealer, tracker)
+            if not reset_stacks_each_hand:
+                # Tournament style: stacks carry over to the next hand.
+                self._gs.starting_stacks = list(final)
+            dealer = self._next_live(dealer)
 
             if self.verbose and hand_num % 100 == 0:
                 print(f"  ... {hand_num}/{num_hands} hands", file=sys.stderr)
 
         return tracker
+
+    def _next_live(self, seat: int) -> int:
+        stacks = self._gs.starting_stacks
+        for k in range(1, self.num_players + 1):
+            s = (seat + k) % self.num_players
+            if stacks[s] > 0:
+                return s
+        return (seat + 1) % self.num_players
 
     # ------------------------------------------------------------------
     # Single hand
@@ -136,7 +156,7 @@ class GameRunner:
                 seat=i,
                 hole_cards=list(hole_cards[i]),
                 num_players=self.num_players,
-                stacks=list(gs.stacks),
+                stacks=list(gs.starting_stacks),
                 dealer_seat=dealer,
                 small_blind=self.small_blind,
                 big_blind=self.big_blind,
@@ -147,13 +167,8 @@ class GameRunner:
         vpip_seats: set[int] = set()
         pfr_seats: set[int] = set()
 
-        # Stacks before the hand (after blinds are posted)
-        stacks_before = [
-            self.starting_stack
-            if self._gs.starting_stacks[i] == self.starting_stack
-            else gs.stacks[i] + gs.current_bets[i]
-            for i in range(self.num_players)
-        ]
+        # Stacks before the hand (before blinds)
+        stacks_before = list(gs.starting_stacks)
 
         # --- Betting rounds ---
         boards_dealt = 0
@@ -166,8 +181,10 @@ class GameRunner:
 
             # Get action from bot (with error handling)
             try:
-                action = bot.act(gs)
-                # Validate
+                # Each bot sees only its own hole cards, via a copy it
+                # cannot use to mutate the real game (design doc §23.1).
+                action = bot.act(gs.view_for(actor))
+                action = copy.copy(action)
                 action = self._validate_action(action, gs, actor)
             except Exception as e:
                 if self.verbose:
@@ -190,9 +207,9 @@ class GameRunner:
             gs.apply_action(action)
             action_count += 1
 
-            # Notify all bots of the action
-            for b in self.bots:
-                b.observe_action(action, gs)
+            # Notify all bots of the action (each gets its own copies)
+            for seat, b in enumerate(self.bots):
+                b.observe_action(copy.copy(action), gs.view_for(seat))
 
             # Deal board cards when street advances
             if not gs.hand_over and gs.street != old_street:
@@ -203,21 +220,25 @@ class GameRunner:
                 for b in self.bots:
                     b.observe_board(gs.street, list(gs.board))
 
-        # --- Determine winners ---
+        # --- Run out the board if players are all-in (same burn protocol) ---
+        if len(gs.active_players) > 1:
+            while len(gs.board) < 5:
+                nxt = {0: Street.FLOP, 3: Street.TURN, 4: Street.RIVER}[len(gs.board)]
+                self._deal_street(gs, nxt)
+                for b in self.bots:
+                    b.observe_board(nxt, list(gs.board))
+
+        # --- Determine winners (with side pots) ---
         winners, amounts = self._resolve_winners(gs)
 
-        # --- Compute net won per seat ---
+        # --- Net result per seat: final stack − stack before the hand ---
         net_won = {}
-        for i in range(self.num_players):
-            chips_invested = stacks_before[i] - gs.stacks[i] - amounts.get(i, 0)
-            net_won[i] = amounts.get(i, 0) - (stacks_before[i] - gs.stacks[i] - amounts.get(i, 0))
-
-        # Simpler: net = final_stack - starting_stack
         for i in range(self.num_players):
             final = gs.stacks[i] + amounts.get(i, 0)
             net_won[i] = final - stacks_before[i]
 
-        went_to_showdown = gs.street == Street.SHOWDOWN and len(gs.active_players) > 1
+        went_to_showdown = len(gs.active_players) > 1
+        showdown_seats = set(gs.active_players) if went_to_showdown else set()
 
         # --- Showdown info ---
         showdown_info = None
@@ -263,66 +284,85 @@ class GameRunner:
             pot=gs.pot,
             vpip_seats=vpip_seats,
             pfr_seats=pfr_seats,
+            showdown_seats=showdown_seats,
+            dealt_seats={i for i in range(self.num_players) if stacks_before[i] > 0},
         )
+        return [gs.stacks[i] + amounts.get(i, 0) for i in range(self.num_players)]
 
     # ------------------------------------------------------------------
     # Board dealing
     # ------------------------------------------------------------------
     def _deal_board(self, gs: GameState, boards_dealt: int):
-        """Deal community cards for the new street."""
-        if gs.street == Street.FLOP and boards_dealt < 1:
-            self._deck.deal_one()  # burn
-            gs.board = self._deck.deal(3)
-        elif gs.street == Street.TURN and boards_dealt < 2:
-            self._deck.deal_one()  # burn
-            gs.board.append(self._deck.deal_one())
-        elif gs.street == Street.RIVER and boards_dealt < 3:
-            self._deck.deal_one()  # burn
-            gs.board.append(self._deck.deal_one())
-
+        """Deal community cards for the street the game just advanced to."""
+        target = {Street.FLOP: 3, Street.TURN: 4, Street.RIVER: 5}.get(gs.street, 0)
+        while len(gs.board) < target:
+            nxt = {0: Street.FLOP, 3: Street.TURN, 4: Street.RIVER}[len(gs.board)]
+            self._deal_street(gs, nxt)
         if self.verbose and gs.board:
-            board_str = " ".join(card_str(c) for c in gs.board)
-            print(f"  Board: [{board_str}]")
+            print(f"  Board: [{' '.join(card_str(c) for c in gs.board)}]")
+
+    def _deal_street(self, gs: GameState, street: Street):
+        """One burn card, then the street's cards.
+
+        Every path (normal play and the all-in run-out) uses this, so the
+        deck order is identical regardless of how the hand ends.  The old
+        run-out dealt burn+1 card three times for a flop, a different card
+        order from normal play.
+        """
+        self._deck.deal_one()  # burn
+        if street == Street.FLOP:
+            gs.board = self._deck.deal(3)
+        else:
+            gs.board.append(self._deck.deal_one())
 
     # ------------------------------------------------------------------
-    # Winner resolution
+    # Winner resolution with side pots
     # ------------------------------------------------------------------
     def _resolve_winners(self, gs: GameState) -> tuple[list[int], dict[int, int]]:
         """
-        Determine winner(s) and distribute the pot.
-        Returns (winner_seats, {seat: chips_won}).
-        """
-        active = gs.active_players
+        Distribute the pot, layer by layer (main pot + side pots).
 
-        if len(active) == 1:
-            # Everyone else folded
-            winner = active[0]
-            return [winner], {winner: gs.pot}
+        contribution[i] = chips player i put in this hand.  Each distinct
+        contribution level of a live player defines a layer; a layer is
+        contested only by live players who contributed at least that much.
+        Uncalled excess returns to its owner as a layer they alone contest.
+        Odd chips go to the first eligible winner left of the dealer.
+        """
+        n = gs.num_players
+        active = gs.active_players
+        contrib = [gs.starting_stacks[i] - gs.stacks[i] for i in range(n)]
 
         if len(active) == 0:
             return [], {}
+        if len(active) == 1:
+            return [active[0]], {active[0]: gs.pot}
 
-        # Showdown: make sure we have 5 community cards
-        while len(gs.board) < 5:
-            self._deck.deal_one()  # burn
-            gs.board.append(self._deck.deal_one())
-
-        # Evaluate each active player's hand
-        hand_ranks = {}
-        for seat in active:
-            hand_ranks[seat] = evaluate(gs.hole_cards[seat] + gs.board)
-
-        best_rank = max(hand_ranks.values())
-        winners = [seat for seat, hr in hand_ranks.items() if hr == best_rank]
-
-        # Split pot evenly among winners
-        share = gs.pot // len(winners)
-        remainder = gs.pot - share * len(winners)
-        amounts = {w: share for w in winners}
-        # Give remainder to first winner (positional advantage)
-        if remainder > 0:
-            amounts[winners[0]] += remainder
-
+        ranks = {s: evaluate(gs.hole_cards[s] + gs.board) for s in active}
+        order = [(gs.dealer_seat + k) % n for k in range(1, n + 1)]
+        amounts: dict[int, int] = {}
+        levels = sorted({contrib[s] for s in active if contrib[s] > 0})
+        prev = 0
+        distributed = 0
+        last_winners: list[int] = []
+        for level in levels:
+            layer = sum(min(contrib[i], level) - min(contrib[i], prev) for i in range(n))
+            eligible = [s for s in active if contrib[s] >= level]
+            if layer <= 0 or not eligible:
+                prev = level
+                continue
+            best = max(ranks[s] for s in eligible)
+            win = [s for s in order if s in eligible and ranks[s] == best]
+            share, rem = divmod(layer, len(win))
+            for w in win:
+                amounts[w] = amounts.get(w, 0) + share
+            amounts[win[0]] += rem
+            distributed += layer
+            last_winners = win
+            prev = level
+        leftover = gs.pot - distributed
+        if leftover > 0 and last_winners:
+            amounts[last_winners[0]] = amounts.get(last_winners[0], 0) + leftover
+        winners = [s for s in order if amounts.get(s, 0) > 0]
         return winners, amounts
 
     # ------------------------------------------------------------------
@@ -344,7 +384,7 @@ class GameRunner:
             if la.action_type == action.action_type:
                 if la.max_amount > 0:
                     action.amount = max(la.min_amount,
-                                        min(action.amount, la.max_amount))
+                                        min(int(action.amount), la.max_amount))
                 else:
                     action.amount = la.min_amount
                 break

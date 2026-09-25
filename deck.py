@@ -24,7 +24,7 @@ class Deck:
 
     def deal(self, n: int = 1) -> list[int]:
         """Deal n cards off the top."""
-        if self._idx + n > NUM_CARDS:
+        if self._idx + n > len(self._cards):
             raise RuntimeError("Deck exhausted")
         dealt = self._cards[self._idx : self._idx + n]
         self._idx += n
@@ -34,14 +34,15 @@ class Deck:
         return self.deal(1)[0]
 
     def remove(self, cards: list[int]):
-        """Remove specific cards (for Monte Carlo with known cards)."""
+        """Remove specific un-dealt cards (for Monte Carlo with known cards)."""
         for c in cards:
             if c in self._cards[self._idx:]:
                 self._cards.remove(c)
 
     @property
     def remaining(self) -> int:
-        return NUM_CARDS - self._idx
+        # len(self._cards), not NUM_CARDS, so that remove() is reflected.
+        return len(self._cards) - self._idx
 
     def shuffle_remaining(self):
         """Re-shuffle only the un-dealt portion."""

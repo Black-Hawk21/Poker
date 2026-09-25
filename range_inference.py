@@ -1,523 +1,364 @@
 """
-Bayesian Range Inference — Section 10
-======================================
-The central inference problem (Equation 32):
+Bayesian Range Inference  (design doc §11)
+==========================================
+    P(h | A, O, M) ∝ P(A | h, O, M) · P(h | O, M)                  (Eq. 25)
+    P(h | A_1..A_t) ∝ P(A_t | h, A_1:t−1) · P(h | A_1:t−1)         (Eq. 26)
 
-    P(H_opp | O, M_opp)
+Corrections relative to the original code:
 
-Given opponent actions and our learned model, what hands could they hold?
-
-Bayes' rule (Equation 33):
-    P(h | A, O, M) ∝ P(A | h, O, M) · P(h | O, M)
-
-After multiple actions (Equation 34):
-    P(h | A_1,...,A_t) ∝ P(A_t | h, A_{1:t-1}) · P(h | A_{1:t-1})
-
-This produces a live range that narrows as the hand progresses:
-
-    Preflop range  →  observe raise  →  updated range
-                   →  observe flop bet →  updated range
-                   →  observe turn check → updated range
-                   →  final posterior range
-
-The range is a list of (hand, weight) pairs that feeds directly into
-the Monte Carlo equity estimator (Equation 6):
-
-    h ~ P(H_opp | O, M_opp)
-
-Key design principles:
-  - Maintain probability mass over MANY hands (Section 25.2)
-  - Never collapse to a single guessed hand too early
-  - Use opponent model stats for action likelihoods
-  - Board texture influences which hands take which actions
+* The likelihood P(A | h, s, M) comes from the explicit, per-opponent
+  calibrated model in `action_likelihood` (§12) instead of hand-written
+  step functions on absolute hand category.
+* A range is always a set of **card-consistent combos**.  Combos touching
+  hero's cards or the board have weight exactly zero, so blockers shift
+  the posterior automatically (§3.2).
+* The full weighted posterior is handed to the equity engine.  The old
+  `to_combo_list()` sorted by weight and truncated to ~200 entries, which
+  silently turned every range into its strongest ~5%.
+* Folded opponents are removed from the equity calculation rather than
+  being re-entered as random hands.
+* Pruning keeps anything above 1e-4 of the maximum weight.  The old 2%
+  threshold eliminated bluffs after about three streets of betting — the
+  "range narrows too early" failure mode of §29.
+* Preflop ranges start from all card-consistent combos and are narrowed by
+  the *actions* (with likelihoods calibrated to the opponent's VPIP/PFR per
+  cell), rather than by pre-applying VPIP and then applying the action
+  again, which double-counted the same evidence.
 """
 
 from __future__ import annotations
+import math
 from itertools import combinations
-from typing import Optional
+from typing import Iterable, Optional
 
-from hand_evaluator import (
-    card_rank, card_suit, evaluate, HandRank, RANK_VALUE, RANKS
-)
-from game_state import ActionType, Street
-from board_texture import analyze_board
-from opponent_model import OpponentModel
+from hand_evaluator import card_rank, card_suit, card_str
+from hand_strength import strength_table, PREFLOP_PERCENTILE, RANKS
+from game_state import Action, ActionType, Street
+from opponent_model import OpponentModel, decision_cell, action_kind
+from action_likelihood import ActionLikelihoodModel, DEFAULT_LIKELIHOOD_MODEL
+
+Combo = tuple[int, int]
 
 
 # ---------------------------------------------------------------------------
-# Preflop hand strength table (used for initial range construction)
+# Helpers (kept for backward compatibility)
 # ---------------------------------------------------------------------------
 def _preflop_hand_class(c1: int, c2: int) -> tuple[int, int, bool]:
-    """Return (high_rank, low_rank, suited) for a two-card hand."""
     r1, r2 = card_rank(c1), card_rank(c2)
-    suited = card_suit(c1) == card_suit(c2)
-    return (max(r1, r2), min(r1, r2), suited)
+    return (max(r1, r2), min(r1, r2), card_suit(c1) == card_suit(c2))
 
 
 def _preflop_strength(high: int, low: int, suited: bool) -> float:
-    """
-    Rough preflop hand strength 0–1.
-    Pairs occupy 0.50–0.98. Non-pairs occupy 0.02–0.499.
-    Within non-pairs, suited > offsuit, connected > gapped, broadway > low.
-    """
+    """Preflop percentile of a hand class (see hand_strength)."""
     if high == low:
-        return 0.50 + (high / 12) * 0.48
-
-    # Non-pair: base from rank sum, scaled to [0, ~0.43]
-    base = (high * 2.0 + low) / 36.0 * 0.43
-    bonus = 0.0
-    if suited:
-        bonus += 0.025
-    gap = high - low
-    if gap <= 2:
-        bonus += 0.015
-    if high >= 10:
-        bonus += 0.015
-    return min(0.499, max(0.02, base + bonus))
+        name = RANKS[high] * 2
+    else:
+        name = RANKS[high] + RANKS[low] + ("s" if suited else "o")
+    return PREFLOP_PERCENTILE[name]
 
 
-# ---------------------------------------------------------------------------
-# All possible 2-card combos
-# ---------------------------------------------------------------------------
-def all_two_card_combos(exclude: set[int] = None) -> list[tuple[int, int]]:
-    """Generate all C(52,2) = 1326 possible two-card holdings, minus excluded."""
+def all_two_card_combos(exclude: Optional[set[int]] = None) -> list[Combo]:
     exclude = exclude or set()
-    available = [c for c in range(52) if c not in exclude]
-    return list(combinations(available, 2))
+    return list(combinations([c for c in range(52) if c not in exclude], 2))
 
 
 # ---------------------------------------------------------------------------
-# Live Range — the core data structure
+# LiveRange
 # ---------------------------------------------------------------------------
 class LiveRange:
-    """
-    A probability distribution over possible opponent hands.
+    """A weighted distribution over card-consistent opponent combos."""
 
-    Each hand is a (card1, card2) tuple with an associated weight.
-    Weights are un-normalized log-probabilities that get normalized
-    when sampling or querying.
+    PRUNE_FRAC = 1e-4
 
-    The range narrows as Bayesian updates are applied from observed actions.
-    """
-
-    def __init__(self, hands_weights: Optional[dict[tuple[int, int], float]] = None):
-        # {(card1, card2): weight}
-        self._weights: dict[tuple[int, int], float] = hands_weights or {}
+    def __init__(self, hands_weights: Optional[dict[Combo, float]] = None):
+        self._weights: dict[Combo, float] = dict(hands_weights or {})
+        self.folded = False
 
     @classmethod
-    def uniform(cls, exclude: set[int] = None) -> "LiveRange":
-        """Start with a uniform range over all possible hands."""
-        combos = all_two_card_combos(exclude)
-        return cls({h: 1.0 for h in combos})
+    def uniform(cls, exclude: Optional[set[int]] = None) -> "LiveRange":
+        return cls({h: 1.0 for h in all_two_card_combos(exclude)})
 
     @classmethod
-    def from_vpip(cls, vpip: float, exclude: set[int] = None) -> "LiveRange":
-        """
-        Construct a preflop range based on opponent's VPIP.
-        Hands stronger than the VPIP percentile get full weight;
-        hands near the boundary get partial weight.
-        """
-        combos = all_two_card_combos(exclude)
-
-        # Score every hand and sort
-        scored = []
-        for h in combos:
-            high, low, suited = _preflop_hand_class(h[0], h[1])
-            strength = _preflop_strength(high, low, suited)
-            scored.append((h, strength))
-
-        scored.sort(key=lambda x: x[1], reverse=True)
-
-        # Top `vpip` fraction gets full weight, next 10% tapers
-        n = len(scored)
-        cutoff_idx = int(n * vpip)
-        taper_idx = int(n * min(vpip + 0.10, 1.0))
-
-        weights = {}
-        for i, (hand, strength) in enumerate(scored):
-            if i < cutoff_idx:
-                weights[hand] = 1.0
-            elif i < taper_idx:
-                # Linear taper
-                frac = 1.0 - (i - cutoff_idx) / max(taper_idx - cutoff_idx, 1)
-                weights[hand] = max(0.05, frac)
-            else:
-                weights[hand] = 0.01  # tiny residual (Section 25.2)
-
-        return cls(weights)
+    def from_vpip(cls, vpip: float, exclude: Optional[set[int]] = None,
+                  width: float = 0.04, floor: float = 0.01) -> "LiveRange":
+        """Range of a player who entered with frequency `vpip`: combos above
+        the (1−vpip) preflop percentile, with a smooth edge and a small
+        residual weight everywhere (never exactly zero)."""
+        t = 1.0 - vpip
+        w = {}
+        for h in all_two_card_combos(exclude):
+            s = _preflop_strength(*_preflop_hand_class(*h))
+            x = (s - t) / width
+            sig = 1.0 / (1.0 + math.exp(-max(min(x, 60), -60)))
+            w[h] = floor + (1 - floor) * sig
+        return cls(w)
 
     # ------------------------------------------------------------------
-    # Bayesian update (Equations 33–34)
+    # Card removal
     # ------------------------------------------------------------------
-    def update(self, action_type: int, street: int,
-               board: list[int], model: Optional[OpponentModel] = None,
-               pot: int = 0, bet_amount: int = 0,
-               facing_bet: bool = False):
-        """
-        Apply one Bayesian update based on an observed action.
+    def remove_cards(self, cards: Iterable[int]):
+        """Posterior is identically zero on combos blocked by known cards."""
+        cs = set(cards)
+        if cs:
+            self._weights = {h: w for h, w in self._weights.items()
+                             if h[0] not in cs and h[1] not in cs}
 
-        P(h | action) ∝ P(action | h) · P(h)
-
-        The action likelihood P(action | h) depends on:
-          - hand strength given the board
-          - opponent model stats (aggression, bluff freq, etc.)
-          - bet sizing relative to pot
-        """
-        if not self._weights or not board and street > Street.PREFLOP:
-            return  # nothing to update post-flop without a board
-
-        new_weights = {}
-        for hand, prior_w in self._weights.items():
-            if prior_w <= 0:
-                continue
-
-            likelihood = self._action_likelihood(
-                hand, action_type, street, board, model,
-                pot, bet_amount, facing_bet
-            )
-            new_weights[hand] = prior_w * likelihood
-
-        self._weights = new_weights
+    # ------------------------------------------------------------------
+    # Bayesian update
+    # ------------------------------------------------------------------
+    def apply_likelihoods(self, lk: dict[Combo, float]):
+        self._weights = {h: w * lk.get(h, 0.0) for h, w in self._weights.items()}
         self._prune()
 
-    def _action_likelihood(
-        self, hand: tuple[int, int], action_type: int, street: int,
-        board: list[int], model: Optional[OpponentModel],
-        pot: int, bet_amount: int, facing_bet: bool,
-    ) -> float:
+    def update_observed(self, kind: str, decision: str, board: list[int],
+                        dead: Iterable[int] = (),
+                        model: Optional[OpponentModel] = None,
+                        cell: tuple = (),
+                        size_fraction: Optional[float] = None,
+                        faced_size: Optional[float] = None,
+                        likelihood_model: Optional[ActionLikelihoodModel] = None):
+        """One Bayesian update (Eq. 26) for an observed action class."""
+        if kind == "fold":
+            self.folded = True
+            self._weights.clear()
+            return
+        if not self._weights:
+            return
+        lm = likelihood_model or DEFAULT_LIKELIHOOD_MODEL
+        strengths = strength_table(board, dead)
+        lk = lm.likelihoods(strengths, self._weights, decision, kind, model,
+                            cell, size_fraction, faced_size)
+        self.apply_likelihoods(lk)
+
+    def update(self, action_type: int, street: int, board: list[int],
+               model: Optional[OpponentModel] = None, pot: int = 0,
+               bet_amount: int = 0, facing_bet: bool = False):
+        """Legacy postflop update from raw action parameters.
+
+        Note: a postflop FOLD is informative here (it re-weights toward the
+        hands that fold) rather than emptying the range, so callers can see
+        what the folding range looked like.  RangeTracker drops folded
+        opponents from equity separately.
         """
-        Estimate P(action | hand, state, model).
+        if street > Street.PREFLOP and not board:
+            return
+        aggressive = action_type in (ActionType.BET, ActionType.RAISE, ActionType.ALL_IN)
+        kind = action_kind(action_type, aggressive, facing_bet)
+        if kind == "fold" and not facing_bet:
+            facing_bet = True
+        decision = "facing" if facing_bet else "unopened"
+        if decision == "unopened" and kind in ("call", "raise"):
+            kind = "bet" if kind == "raise" else "check"
+        size = (bet_amount / pot) if (aggressive and pot > 0) else None
+        lm = DEFAULT_LIKELIHOOD_MODEL
+        strengths = strength_table(board, ())
+        lk = lm.likelihoods(strengths, self._weights, decision, kind, model,
+                            (int(street),), size, None)
+        self.apply_likelihoods(lk)
 
-        Strong hands are more likely to bet/raise.
-        Weak hands are more likely to fold or check.
-        Draws may call or semi-bluff.
-        """
-        # Evaluate hand strength if we have a board
-        if board:
-            try:
-                hr = evaluate(list(hand) + board)
-                # Normalize category to 0-1 strength
-                strength = (hr.category + hr.tiebreakers[0] / 13.0) / 8.5
-            except Exception:
-                strength = 0.5
-        else:
-            # Preflop
-            high, low, suited = _preflop_hand_class(hand[0], hand[1])
-            strength = _preflop_strength(high, low, suited)
-
-        # Get model-based stats if available
-        if model:
-            aggression = model.postflop_aggression.mean
-            bluff_freq = model.bluff_frequency.mean
-            fold_rate = model.fold_to_bet.mean
-        else:
-            aggression = 0.5
-            bluff_freq = 0.25
-            fold_rate = 0.40
-
-        # Compute action likelihoods based on hand strength
-        if action_type == ActionType.FOLD:
-            # Strong hands almost never fold; weak hands often fold
-            return max(0.01, (1.0 - strength) * 0.8 + 0.1)
-
-        elif action_type == ActionType.CHECK:
-            # Medium hands check; very strong may trap; very weak may give up
-            if strength > 0.8:
-                return 0.3  # sometimes traps
-            elif strength > 0.4:
-                return 0.6  # often checks medium hands
-            else:
-                return 0.5  # weak hands check when no bet to face
-
-        elif action_type == ActionType.CALL:
-            # Calling range: medium-to-strong hands, draws
-            if strength > 0.7:
-                return 0.5  # strong hands sometimes just call (slow-play)
-            elif strength > 0.3:
-                return 0.7  # bread-and-butter calling range
-            else:
-                return 0.15 + bluff_freq * 0.3  # weak hands rarely call
-
-        elif action_type in (ActionType.BET, ActionType.RAISE, ActionType.ALL_IN):
-            # Betting/raising: polarized — very strong OR bluffs
-            if strength > 0.75:
-                # Value bet: strong hands bet for value
-                return 0.7 + aggression * 0.2
-            elif strength > 0.5:
-                # Medium hands: sometimes bets, less likely to raise
-                if action_type == ActionType.RAISE:
-                    return 0.2
-                return 0.3 + aggression * 0.2
-            elif strength > 0.25:
-                # Draws / semi-bluffs
-                if board:
-                    bt = analyze_board(board)
-                    if bt.flush_draw_possible or bt.straight_draw_possible:
-                        return 0.25 + aggression * 0.2  # semi-bluff
-                return 0.10 + bluff_freq * 0.3
-            else:
-                # Pure bluff territory
-                return 0.05 + bluff_freq * 0.4
-
-        return 0.3  # default
-
-    # ------------------------------------------------------------------
-    # Preflop-specific updates
-    # ------------------------------------------------------------------
     def update_preflop(self, action_type: int,
                        model: Optional[OpponentModel] = None,
                        is_raise: bool = False, facing_raise: bool = False):
-        """
-        Specialized preflop update.
-        - FOLD narrows to nothing (hand is gone)
-        - CALL keeps medium+ hands
-        - RAISE keeps strong hands + some bluffs
-        """
+        """Legacy preflop update: FOLD empties the range; otherwise the
+        calibrated preflop likelihood is applied."""
         if action_type == ActionType.FOLD:
+            self.folded = True
             self._weights.clear()
             return
-
-        pfr = model.pfr.mean if model else 0.30
-        three_bet = model.three_bet.mean if model else 0.10
-
-        new_weights = {}
-        for hand, prior_w in self._weights.items():
-            if prior_w <= 0:
-                continue
-
-            high, low, suited = _preflop_hand_class(hand[0], hand[1])
-            strength = _preflop_strength(high, low, suited)
-
-            if action_type in (ActionType.RAISE, ActionType.BET, ActionType.ALL_IN):
-                if facing_raise:
-                    # 3-bet: very strong range + some bluffs
-                    if strength > 0.7:
-                        likelihood = 0.8
-                    elif strength > 0.5 and suited:
-                        likelihood = three_bet * 0.5  # suited bluff 3-bet
-                    else:
-                        likelihood = 0.02
-                else:
-                    # Open raise
-                    if strength > (1.0 - pfr * 1.2):
-                        likelihood = 0.8
-                    else:
-                        likelihood = 0.05
-            elif action_type == ActionType.CALL:
-                # Calling range: medium hands that didn't raise
-                if strength > 0.35:
-                    likelihood = 0.6
-                else:
-                    likelihood = 0.1
-            else:
-                likelihood = 0.3
-
-            new_weights[hand] = prior_w * likelihood
-
-        self._weights = new_weights
-        self._prune()
+        kind = "raise" if (is_raise or action_type in (
+            ActionType.RAISE, ActionType.BET, ActionType.ALL_IN)) else (
+            "check" if action_type == ActionType.CHECK else "call")
+        cell = ("raised" if facing_raise else "open",)
+        self.update_observed(kind, "preflop", [], (), model, cell)
 
     # ------------------------------------------------------------------
-    # Pruning — remove negligible hands (Section 25.2 balance)
+    # Pruning
     # ------------------------------------------------------------------
-    def _prune(self, min_frac: float = 0.02):
-        """
-        Remove hands whose weight is < min_frac of the maximum.
-        Keeps probability mass spread (Section 25.2) but trims noise.
-        """
+    def _prune(self, min_frac: Optional[float] = None):
         if not self._weights:
             return
-        max_w = max(self._weights.values())
-        if max_w <= 0:
+        mx = max(self._weights.values())
+        if mx <= 0:
+            self._weights = {}
             return
-        threshold = max_w * min_frac
-        self._weights = {h: w for h, w in self._weights.items()
-                         if w >= threshold}
+        thr = mx * (self.PRUNE_FRAC if min_frac is None else min_frac)
+        self._weights = {h: w for h, w in self._weights.items() if w >= thr}
 
     # ------------------------------------------------------------------
     # Queries
     # ------------------------------------------------------------------
+    def normalized(self) -> dict[Combo, float]:
+        tot = sum(self._weights.values())
+        return {h: w / tot for h, w in self._weights.items()} if tot > 0 else {}
+
     def to_weighted_combos(self, top_n: Optional[int] = None,
-                           min_weight_frac: float = 0.01
-                           ) -> list[tuple[tuple[int, int], float]]:
-        """
-        Return hands with normalized weights, sorted by weight descending.
-        Filters out hands below min_weight_frac of the max weight.
-        """
+                           min_weight_frac: float = 0.0
+                           ) -> list[tuple[Combo, float]]:
+        """[(combo, normalized weight)] sorted by weight, optionally filtered."""
         if not self._weights:
             return []
-
-        max_w = max(self._weights.values())
-        if max_w <= 0:
-            return []
-
-        threshold = max_w * min_weight_frac
-        filtered = [
-            (h, w) for h, w in self._weights.items() if w >= threshold
-        ]
-        filtered.sort(key=lambda x: x[1], reverse=True)
-
+        mx = max(self._weights.values())
+        items = [(h, w) for h, w in self._weights.items() if w >= mx * min_weight_frac]
+        items.sort(key=lambda x: x[1], reverse=True)
         if top_n:
-            filtered = filtered[:top_n]
+            items = items[:top_n]
+        tot = sum(w for _, w in items)
+        return [(h, w / tot) for h, w in items] if tot > 0 else []
 
-        # Normalize
-        total = sum(w for _, w in filtered)
-        if total > 0:
-            filtered = [(h, w / total) for h, w in filtered]
-
-        return filtered
-
-    def to_combo_list(self, top_n: int = 200) -> list[tuple[int, int]]:
-        """
-        Return the top hands as a flat list suitable for equity.monte_carlo_equity().
-        The equity estimator samples uniformly from this list, so we include
-        hands proportional to their weight by repeating high-weight hands.
-        """
-        weighted = self.to_weighted_combos(min_weight_frac=0.02)
-        if not weighted:
-            return []
-
-        # Build a list with repetitions proportional to weight
-        # Aim for ~top_n total entries
-        max_w = max(w for _, w in weighted)
-        result = []
-        for hand, w in weighted:
-            copies = max(1, int((w / max_w) * 3 + 0.5))
-            result.extend([hand] * copies)
-            if len(result) >= top_n:
-                break
-
-        return result
+    def to_combo_list(self, top_n: Optional[int] = None) -> list[tuple[Combo, float]]:
+        """The full weighted posterior, in the (combo, weight) format the
+        equity engine accepts.  `top_n` is ignored on purpose: truncating a
+        range to its heaviest combos biases equity (see module docstring)."""
+        return list(self.normalized().items())
 
     @property
     def size(self) -> int:
-        """Number of hands with positive weight."""
         return sum(1 for w in self._weights.values() if w > 0)
 
     @property
     def total_weight(self) -> float:
         return sum(w for w in self._weights.values() if w > 0)
 
+    def entropy_bits(self) -> float:
+        return -sum(p * math.log2(p) for p in self.normalized().values() if p > 0)
+
     def top_hands(self, n: int = 10) -> list[tuple[str, float]]:
-        """Return top n hands as (description, weight) for debugging."""
-        from hand_evaluator import card_str
-        weighted = self.to_weighted_combos(top_n=n)
         return [(f"{card_str(h[0])}{card_str(h[1])}", round(w, 4))
-                for h, w in weighted]
+                for h, w in self.to_weighted_combos(top_n=n)]
 
 
 # ---------------------------------------------------------------------------
-# Range Tracker — manages per-opponent live ranges across a hand
+# Range Tracker — per-opponent live ranges across a hand
 # ---------------------------------------------------------------------------
 class RangeTracker:
     """
-    Maintains a LiveRange for each opponent during a hand.
+    Maintains a LiveRange for each opponent during one hand.
 
-    Usage:
         tracker = RangeTracker(hero_seat=0, hero_cards=[As, Kd])
-        tracker.init_preflop(num_players=2, models={1: opp_model})
-        tracker.update_action(action, street, board, pot)
-        ranges = tracker.get_ranges()  # for equity estimator
+        tracker.init_preflop(num_players=2, models={1: opp_model},
+                             positions=["BTN", "BB"])
+        tracker.update_action(..., action=action)   # Action carries pre-action context
+        tracker.update_board(flop)
+        ranges = tracker.get_ranges_for_equity()    # active opponents only
     """
 
-    def __init__(self, hero_seat: int, hero_cards: list[int]):
+    def __init__(self, hero_seat: int, hero_cards: list[int],
+                 likelihood_model: Optional[ActionLikelihoodModel] = None):
         self.hero_seat = hero_seat
-        self.hero_cards = hero_cards
+        self.hero_cards = list(hero_cards)
+        self.lm = likelihood_model or DEFAULT_LIKELIHOOD_MODEL
         self._ranges: dict[int, LiveRange] = {}
         self._models: dict[int, OpponentModel] = {}
+        self._positions: list[str] = []
+        self._board: list[int] = []
         self._excluded = set(hero_cards)
+        self._last_aggressor: Optional[int] = None      # current street
+        self._prev_street_aggressor: Optional[int] = None
+        self._street = 0
 
     def init_preflop(self, num_players: int,
-                     models: Optional[dict[int, OpponentModel]] = None):
-        """
-        Create initial ranges for all opponents based on their VPIP.
-        Uses population prior if no model is available (Section 16).
-        """
+                     models: Optional[dict[int, OpponentModel]] = None,
+                     positions: Optional[list[str]] = None,
+                     sitting_out: Iterable[int] = ()):
         self._models = models or {}
-
+        self._positions = list(positions or [])
+        out = set(sitting_out)
         for seat in range(num_players):
-            if seat == self.hero_seat:
+            if seat == self.hero_seat or seat in out:
                 continue
+            self._ranges[seat] = LiveRange.uniform(self._excluded)
 
-            model = self._models.get(seat)
-            if model and model.vpip.count > 5:
-                vpip = model.vpip.mean
-            else:
-                vpip = 0.50  # population prior
+    def _position(self, seat: int) -> str:
+        return self._positions[seat] if seat < len(self._positions) else "MP"
 
-            self._ranges[seat] = LiveRange.from_vpip(vpip, self._excluded)
+    def _new_street(self, street: int):
+        if street != self._street:
+            self._prev_street_aggressor = self._last_aggressor
+            self._last_aggressor = None
+            self._street = street
 
     def update_action(self, action_seat: int, action_type: int,
                       street: int, board: list[int],
                       pot: int = 0, bet_amount: int = 0,
-                      facing_bet: bool = False):
-        """Apply a Bayesian range update for one opponent's action."""
-        if action_seat == self.hero_seat:
-            return
-        if action_seat not in self._ranges:
-            return
+                      facing_bet: bool = False,
+                      action: Optional[Action] = None):
+        """Apply a Bayesian update for one opponent action.
 
-        live_range = self._ranges[action_seat]
-        model = self._models.get(action_seat)
-
-        if street == Street.PREFLOP:
-            is_raise = action_type in (ActionType.RAISE, ActionType.BET,
-                                       ActionType.ALL_IN)
-            live_range.update_preflop(
-                action_type, model,
-                is_raise=is_raise, facing_raise=facing_bet
-            )
+        Pass the Action object when available: it carries what the player
+        was facing *before* acting (to_call, raises_before, pot_before),
+        which the post-action game state cannot tell you.
+        """
+        self._new_street(int(street))
+        if action is not None:
+            facing_bet = action.to_call > 0
+            raises_before = action.raises_before
+            aggressive = action.is_aggressive
+            size = action.size_fraction if aggressive else None
+            denom = action.pot_before - action.to_call
+            faced = (action.to_call / denom) if (facing_bet and denom > 0) else None
         else:
-            # Remove board cards from hands
-            board_set = set(board)
-            live_range._weights = {
-                h: w for h, w in live_range._weights.items()
-                if h[0] not in board_set and h[1] not in board_set
-            }
-            live_range.update(
-                action_type, street, board, model,
-                pot, bet_amount, facing_bet
-            )
+            raises_before = 1 if (facing_bet and street == Street.PREFLOP) else 0
+            aggressive = action_type in (ActionType.BET, ActionType.RAISE, ActionType.ALL_IN)
+            size = (bet_amount / pot) if (aggressive and pot > 0) else None
+            faced = None
+
+        if aggressive:
+            self._last_aggressor = action_seat
+        if action_seat == self.hero_seat or action_seat not in self._ranges:
+            return
+        lr = self._ranges[action_seat]
+        if lr.folded:
+            return
+
+        was_agg = self._prev_street_aggressor == action_seat
+        decision, cell = decision_cell(street, self._position(action_seat), board,
+                                       was_agg, facing_bet, raises_before)
+        kind = action_kind(action_type, aggressive, facing_bet)
+        if decision == "preflop" and kind == "bet":
+            kind = "raise"
+        dead = self._excluded | set(board)
+        lr.remove_cards(dead)
+        lr.update_observed(kind, decision, board, self._excluded,
+                           self._models.get(action_seat), cell, size, faced, self.lm)
 
     def update_board(self, board: list[int]):
-        """Remove board cards from all ranges (they can't be in anyone's hand)."""
-        board_set = set(board) | self._excluded
-        for seat, lr in self._ranges.items():
-            lr._weights = {
-                h: w for h, w in lr._weights.items()
-                if h[0] not in board_set and h[1] not in board_set
-            }
+        """Board cards cannot be in anyone's hand."""
+        self._board = list(board)
+        dead = set(board) | self._excluded
+        for lr in self._ranges.values():
+            lr.remove_cards(dead)
 
-    def get_ranges_for_equity(self) -> Optional[list[list[tuple[int, int]]]]:
+    def mark_folded(self, seat: int):
+        if seat in self._ranges:
+            self._ranges[seat].folded = True
+            self._ranges[seat]._weights.clear()
+
+    def active_seats(self) -> list[int]:
+        return [s for s in sorted(self._ranges) if not self._ranges[s].folded]
+
+    def get_ranges_for_equity(self, active_seats: Optional[Iterable[int]] = None
+                              ) -> Optional[list[Optional[list[tuple[Combo, float]]]]]:
+        """Weighted ranges for the opponents still in the hand, in seat order.
+
+        The list is aligned with `active_seats` (default: every opponent
+        that has not folded), so its length equals the number of live
+        opponents the equity engine should simulate.
         """
-        Return opponent ranges formatted for equity.monte_carlo_equity().
-        One combo list per opponent, in seat order (skipping hero).
-        """
-        if not self._ranges:
+        seats = self.active_seats() if active_seats is None else \
+            [s for s in active_seats if s != self.hero_seat]
+        if not seats:
             return None
-
-        result = []
-        for seat in sorted(self._ranges.keys()):
-            combo_list = self._ranges[seat].to_combo_list()
-            if combo_list:
-                result.append(combo_list)
-            else:
-                result.append(None)
-
-        # If all ranges are None/empty, return None (fall back to uniform)
-        if all(r is None for r in result):
-            return None
-        return result
+        out = []
+        for s in seats:
+            lr = self._ranges.get(s)
+            out.append(lr.to_combo_list() if (lr and lr.size) else None)
+        return out
 
     def get_range(self, seat: int) -> Optional[LiveRange]:
         return self._ranges.get(seat)
 
     def range_summary(self) -> dict[int, dict]:
-        """Debug summary of all ranges."""
-        summary = {}
-        for seat, lr in self._ranges.items():
-            summary[seat] = {
-                "size": lr.size,
-                "top_hands": lr.top_hands(5),
-            }
-        return summary
+        return {seat: {"size": lr.size, "folded": lr.folded,
+                       "entropy_bits": round(lr.entropy_bits(), 2),
+                       "top_hands": lr.top_hands(5)}
+                for seat, lr in self._ranges.items()}

@@ -1,79 +1,85 @@
 """
-Environment / RNG Analysis — Phase 6
-=====================================
-Infers the environment's pseudo-random seed purely from observable card
-data (hero hole cards, community cards, opponent showdown cards).
+Environment / RNG Analysis  (design doc §23–§24)
+================================================
+Passive prediction only, and only where the competition rules permit it
+(§23.1).  In scope: inferring the environment's card stream from cards the
+bot is legitimately dealt or shown — "card-counting for computers".  Out of
+scope and never attempted: reading other bots' hole cards off the server,
+code execution, auth bypass, memory tampering, DoS.  This module only ever
+reproduces a shuffler locally and compares it against observed cards.
 
-The bot has NO access to the environment's source code.  It must:
-  1. hypothesize how the PRNG works (Section 19.3);
-  2. hypothesize the dealing protocol (card order, burns, etc.);
-  3. eliminate candidate seeds via Bayesian filtering (Section 19.4);
-  4. predict future cards when confidence is high (Section 20).
+Corrections relative to the original code:
 
-Observable information per hand:
-  - hero's hole cards        (every hand)
-  - community board cards    (when the hand reaches that street)
-  - opponent hole cards      (at showdown only)
-
-The module tries multiple (PRNG × protocol) hypotheses in parallel,
-scores each against accumulated observations, and reports the best.
-
-Equations implemented:
-  - Candidate elimination  (Eq. 71):  C_{t+1} = {s ∈ C_t : sim(s) = obs}
-  - Seed posterior          (Eq. 76):  P(S=s|O) ∝ P(O|S=s) P(S=s)
-  - Future-board prediction (Eq. 77):  P(B|O) = Σ_s P(B|S=s,O) P(S=s|O)
-  - Confidence convergence  (Eq. 73):  |C_t| → 1
+* **State recovery, not just a 1000-seed sweep (§23.3).**  A quickly-built
+  arena calls the language default PRNG.  Two escalating attacks are
+  provided.  (a) Seed search: enumerate small seeds (§23.2), and when that
+  window is exhausted, widen it and pin the seed using every observed card
+  as a joint constraint (`_expanded_seed_search`) — one fully shown hand
+  fixes 9 of 52 positions, so the seed is recovered even well outside
+  0–999.  (b) State recovery: `MT19937Recovery` untempers 624 consecutive
+  full 32-bit outputs into the internal state, defeating any seed size —
+  but this needs an arena that leaks whole words (a 32-bit-key sort / index
+  draws), because `random.shuffle` of a 52-card deck leaks only the top
+  <=6 bits per word with rejection gaps and cannot be untempered from the
+  cards alone.  The seed search is what card observations drive here; state
+  recovery is exposed via `recover_from_raw_outputs` for output-leaking
+  arenas.
+* **Call-count offset search (§23.4).**  The number of draws per hand
+  (extra shuffles, tie-breaks, side effects) is usually unknown.  Instead
+  of a fixed `skip_shuffles`, candidates are matched allowing a small,
+  consistent offset in RNG consumption between hands; an offset that stops
+  being consistent falsifies the model.
+* **Protocol-consistent dealing.**  Predictions and the game's own
+  run-out now use the same deal-then-burn order (fixed in game_runner), so
+  a correct seed is no longer eliminated by all-in hands.
+* **Belief over candidates (§23.5) as a weighted feature (§24, §23.6).**
+  The analyzer keeps a posterior over surviving candidates and predicts by
+  marginalizing.  OracleBot feeds the predicted board into the decision
+  engine weighted by that confidence, never as a hard override — both to
+  degrade gracefully and to avoid the statistically detectable footprint of
+  acting on cards it did not see (§23.6).  Opponent hole cards are NOT used
+  to collapse ranges to a single hand: the board may be known, opponent
+  actions are not (§24), and using them would be the clearest tell of all.
+* **Graceful fallback.**  A wrong RNG model actively hurts (§29), so the
+  module reports 0 confidence when no candidate survives and the bot plays
+  pure poker.
 """
 
 from __future__ import annotations
+import math
 import random
 from dataclasses import dataclass, field
 from typing import Optional
+
 from hand_evaluator import card_str
 
 
 # ---------------------------------------------------------------------------
-# Observation — what the bot saw in one hand
+# Observation
 # ---------------------------------------------------------------------------
 @dataclass
 class HandObservation:
-    """Cards observed during one hand."""
-    hand_index: int             # 0-based sequential hand number
+    """Cards observed during one hand (only what the bot may legitimately see)."""
+    hand_index: int
     num_players: int
     hero_seat: int
-    hero_cards: list[int]       # always known (2 cards)
-    board: list[int]            # 0–5 community cards seen
+    hero_cards: list[int]
+    board: list[int] = field(default_factory=list)
     showdown_cards: dict[int, list[int]] = field(default_factory=dict)
-    # seat → [c1, c2] for opponents revealed at showdown
-    # hero's own cards are included in showdown_cards when hand goes to SD
 
     def known_deck_slots(self, protocol: "DealingProtocol") -> dict[int, int]:
-        """
-        Map deck positions → card values based on the dealing protocol.
-        Returns {deck_index: card_value} for all known slots.
-        """
+        """{deck position: card} implied by this observation and a protocol."""
         slots = {}
         n = self.num_players
-
-        # Hero's hole cards
-        hero_positions = protocol.hole_card_positions(self.hero_seat, n)
-        for pos, card in zip(hero_positions, self.hero_cards):
-            slots[pos] = card
-
-        # Opponent showdown cards
+        for pos, c in zip(protocol.hole_card_positions(self.hero_seat, n), self.hero_cards):
+            slots[pos] = c
         for seat, cards in self.showdown_cards.items():
-            if seat == self.hero_seat:
-                continue
-            opp_positions = protocol.hole_card_positions(seat, n)
-            for pos, card in zip(opp_positions, cards):
-                slots[pos] = card
-
-        # Board cards
-        board_positions = protocol.board_positions(n)
-        for i, card in enumerate(self.board):
-            if i < len(board_positions):
-                slots[board_positions[i]] = card
-
+            for pos, c in zip(protocol.hole_card_positions(seat, n), cards):
+                slots[pos] = c
+        for i, c in enumerate(self.board):
+            bp = protocol.board_positions(n)
+            if i < len(bp):
+                slots[bp[i]] = c
         return slots
 
 
@@ -81,290 +87,399 @@ class HandObservation:
 # Dealing protocol hypotheses
 # ---------------------------------------------------------------------------
 class DealingProtocol:
-    """
-    Hypothesis about how the environment maps a shuffled deck to dealt cards.
+    """How a shuffled deck maps to dealt cards."""
 
-    We don't know the environment code, so we try several protocols:
-      A) Standard: deal 2 per seat in order, burn before each street
-      B) No burns: deal 2 per seat in order, no burn cards
-      C) Interleaved: deal 1 card per seat round-robin × 2 rounds, then burns
-    """
-
-    def __init__(self, name: str, has_burns: bool = True,
-                 interleaved: bool = False):
+    def __init__(self, name: str, has_burns: bool = True, interleaved: bool = False):
         self.name = name
         self.has_burns = has_burns
         self.interleaved = interleaved
 
     def hole_card_positions(self, seat: int, num_players: int) -> list[int]:
-        """Return the deck indices for a given seat's hole cards."""
         if self.interleaved:
-            # Round 1: one card each, Round 2: one card each
             return [seat, num_players + seat]
-        else:
-            # Block: 2 consecutive cards per seat
-            return [2 * seat, 2 * seat + 1]
+        return [2 * seat, 2 * seat + 1]
 
     def board_positions(self, num_players: int) -> list[int]:
-        """Return deck indices for [flop1, flop2, flop3, turn, river]."""
-        if self.interleaved:
-            base = 2 * num_players
-        else:
-            base = 2 * num_players
-
+        base = 2 * num_players
         if self.has_burns:
-            # burn, flop×3, burn, turn, burn, river
-            return [base + 1, base + 2, base + 3,   # flop
-                    base + 5,                         # turn
-                    base + 7]                         # river
-        else:
-            # no burns: flop×3, turn, river
-            return [base, base + 1, base + 2,         # flop
-                    base + 3,                          # turn
-                    base + 4]                          # river
+            return [base + 1, base + 2, base + 3, base + 5, base + 7]
+        return [base, base + 1, base + 2, base + 3, base + 4]
+
+    def max_slot(self, num_players: int) -> int:
+        return max(self.board_positions(num_players)) + 1
 
     def __repr__(self):
         return f"Protocol({self.name})"
 
 
-# Pre-built protocol hypotheses
 PROTOCOL_STANDARD = DealingProtocol("standard", has_burns=True, interleaved=False)
 PROTOCOL_NO_BURNS = DealingProtocol("no_burns", has_burns=False, interleaved=False)
 PROTOCOL_INTERLEAVED = DealingProtocol("interleaved", has_burns=True, interleaved=True)
-
 ALL_PROTOCOLS = [PROTOCOL_STANDARD, PROTOCOL_NO_BURNS, PROTOCOL_INTERLEAVED]
 
 
 # ---------------------------------------------------------------------------
-# PRNG hypothesis — how to reproduce the RNG
+# MT19937 state recovery (§23.3)
+# ---------------------------------------------------------------------------
+class MT19937Recovery:
+    """
+    Reconstruct Python's Mersenne Twister state from consecutive 32-bit
+    outputs, then roll it forward deterministically.
+
+    random.random() draws 53 bits as (a·2²⁶ + b)/2⁵³ from two 32-bit words
+    (a = out >> 5, b = out >> 6).  random.shuffle for a 52-card deck calls
+    _randbelow(k) for k = 52..2, each consuming one or more 32-bit words.
+    Rather than invert shuffle directly, we recover the raw 32-bit stream
+    from 624 observed outputs and re-run the *same* generator forward — so
+    we reproduce whatever shuffle/consumption pattern the environment uses,
+    which is the point of §23.4.
+    """
+
+    N = 624
+
+    @staticmethod
+    def _undo_right_xor(value: int, shift: int, mask: int = 0xFFFFFFFF) -> int:
+        """Invert  y = x ^ ((x >> shift) & mask)  for x, rebuilding MSB->LSB."""
+        result = 0
+        i = 0
+        while i * shift < 32:
+            part_mask = ((0xFFFFFFFF << (32 - shift)) & 0xFFFFFFFF) >> (i * shift)
+            part = value & part_mask
+            value ^= (part >> shift) & mask
+            result |= part
+            i += 1
+        return result & 0xFFFFFFFF
+
+    @staticmethod
+    def _undo_left_xor(value: int, shift: int, mask: int) -> int:
+        """Invert  y = x ^ ((x << shift) & mask)  for x, rebuilding LSB->MSB."""
+        result = 0
+        i = 0
+        while i * shift < 32:
+            part_mask = ((0xFFFFFFFF >> (32 - shift)) << (i * shift)) & 0xFFFFFFFF
+            part = value & part_mask
+            value ^= (part << shift) & mask
+            result |= part
+            i += 1
+        return result & 0xFFFFFFFF
+
+    @classmethod
+    def untemper(cls, y: int) -> int:
+        """Reverse MT19937 tempering (applied in the opposite order)."""
+        y = cls._undo_right_xor(y, 18)
+        y = cls._undo_left_xor(y, 15, 0xEFC60000)
+        y = cls._undo_left_xor(y, 7, 0x9D2C5680)
+        y = cls._undo_right_xor(y, 11)
+        return y & 0xFFFFFFFF
+
+    @classmethod
+    def from_outputs(cls, outputs: list[int]) -> Optional[random.Random]:
+        if len(outputs) < cls.N:
+            return None
+        mt = [cls.untemper(o) for o in outputs[:cls.N]]
+        state = (3, tuple(mt + [cls.N]), None)
+        rng = random.Random()
+        try:
+            rng.setstate(state)
+        except (ValueError, TypeError):
+            return None
+        return rng
+
+
+# ---------------------------------------------------------------------------
+# PRNG hypotheses
 # ---------------------------------------------------------------------------
 class PRNGHypothesis:
-    """
-    Hypothesis about the environment's PRNG implementation.
+    """A way to reproduce the environment's shuffled decks.
 
-    We try Python's random.Random (Mersenne Twister).
-
-    Key Section 19.3 insight: "the environment consumes random numbers
-    in other places" that advance the RNG state.  A common pattern is
-    a Deck class whose __init__ shuffles once before the game loop
-    calls reset().  We don't know how many initial shuffles happen,
-    so we try several values for `skip_shuffles`.
-
-    skip_shuffles=0  → first hand = first shuffle from fresh RNG
-    skip_shuffles=1  → one wasted shuffle before hand 0
-    skip_shuffles=2  → two wasted shuffles before hand 0
+    `offset` models §23.4: unknown RNG consumption before the first hand
+    (extra warm-up shuffles / draws).  Matching then also tolerates a small
+    per-hand offset, tried in EnvironmentAnalyzer.
     """
 
-    def __init__(self, name: str = "python_mt", skip_shuffles: int = 0):
-        self.name = f"{name}_skip{skip_shuffles}"
-        self.skip_shuffles = skip_shuffles
+    def __init__(self, name: str = "python_mt", offset: int = 0):
+        self.base = name
+        self.offset = offset
+        self.name = f"{name}_off{offset}"
 
-    def simulate_hands(self, seed: int, num_hands: int,
-                       num_players: int) -> list[list[int]]:
-        """
-        Simulate `num_hands` shuffled decks for a given seed.
-        Returns a list of deck orderings (each is 52 ints).
-        """
+    def simulate_hands(self, seed: int, num_hands: int, num_players: int) -> list[list[int]]:
         rng = random.Random(seed)
-
-        # Consume initial shuffles (unknown environment setup)
-        for _ in range(self.skip_shuffles):
-            warmup = list(range(52))
-            rng.shuffle(warmup)
-
+        for _ in range(self.offset):
+            d = list(range(52))
+            rng.shuffle(d)
         decks = []
         for _ in range(num_hands):
-            deck = list(range(52))
-            rng.shuffle(deck)
-            decks.append(deck)
+            d = list(range(52))
+            rng.shuffle(d)
+            decks.append(d)
         return decks
 
 
-# All PRNG variants to try
-ALL_PRNG_HYPOTHESES = [
-    PRNGHypothesis("python_mt", skip_shuffles=0),
-    PRNGHypothesis("python_mt", skip_shuffles=1),
-    PRNGHypothesis("python_mt", skip_shuffles=2),
-]
+ALL_PRNG_HYPOTHESES = [PRNGHypothesis("python_mt", offset=o) for o in (0, 1, 2)]
 
 
 # ---------------------------------------------------------------------------
-# Seed candidate — tracks one (seed, protocol) pair
+# Candidate
 # ---------------------------------------------------------------------------
 @dataclass
 class SeedCandidate:
     seed: int
     protocol: DealingProtocol
     alive: bool = True
-    mismatches: int = 0        # soft elimination: count mismatches
+    mismatches: int = 0
     hands_checked: int = 0
+    log_weight: float = 0.0
 
 
 # ---------------------------------------------------------------------------
-# Environment Analyzer — the main module
+# Environment Analyzer
 # ---------------------------------------------------------------------------
 class EnvironmentAnalyzer:
     """
-    Maintains a Bayesian posterior over (seed, protocol) candidates
-    and predicts future cards when confident.
+    Posterior over (seed, protocol, PRNG) candidates; predicts by
+    marginalizing when confident (§23.5, Eq. 35–36).
 
-    Usage:
         analyzer = EnvironmentAnalyzer(max_seed=1000)
-        # After each hand, feed observations:
-        analyzer.observe(hand_obs)
-        # Check status:
-        print(analyzer.status())
-        # If confident, predict next hand's cards:
-        prediction = analyzer.predict_next_hand(num_players=2, hero_seat=0)
+        analyzer.observe(hand_obs)          # after each hand
+        analyzer.predict_next_hand(...)     # if confident
     """
 
-    def __init__(
-        self,
-        max_seed: int = 1000,
-        protocols: Optional[list[DealingProtocol]] = None,
-        prng_hypotheses: Optional[list[PRNGHypothesis]] = None,
-        confidence_threshold: float = 0.90,
-    ):
+    def __init__(self, max_seed: int = 1000,
+                 protocols: Optional[list[DealingProtocol]] = None,
+                 prng_hypotheses: Optional[list[PRNGHypothesis]] = None,
+                 confidence_threshold: float = 0.90,
+                 state_recovery: bool = True,
+                 fallback_enabled: bool = True,
+                 fallback_max_seed: int = 100_000,
+                 fallback_batch: int = 200_000,
+                 fallback_time_budget: float = 10.0,
+                 fallback_min_hands: int = 1):
         self.max_seed = max_seed
         self.protocols = protocols or ALL_PROTOCOLS
         self.prng_variants = prng_hypotheses or ALL_PRNG_HYPOTHESES
         self.confidence_threshold = confidence_threshold
+        self.state_recovery = state_recovery
 
-        # All observations collected so far
+        # Fallback: when the initial [0, max_seed) window is exhausted, widen
+        # the search and pin the seed using *every* card observed so far.
+        self.fallback_enabled = fallback_enabled
+        self.fallback_max_seed = fallback_max_seed
+        self.fallback_batch = fallback_batch
+        self.fallback_time_budget = fallback_time_budget
+        self.fallback_min_hands = fallback_min_hands
+        self._fallback_next = max_seed         # first seed not yet checked
+        self._fallback_triggered = False
+
         self.observations: list[HandObservation] = []
-
-        # Candidate tracking: (seed, protocol_idx, prng_idx) → SeedCandidate
         self._candidates: dict[tuple[int, int, int], SeedCandidate] = {}
         for seed in range(max_seed):
             for pi, proto in enumerate(self.protocols):
-                for ri, prng in enumerate(self.prng_variants):
-                    self._candidates[(seed, pi, ri)] = SeedCandidate(
-                        seed=seed, protocol=proto
-                    )
-
+                for ri in range(len(self.prng_variants)):
+                    self._candidates[(seed, pi, ri)] = SeedCandidate(seed=seed, protocol=proto)
         self._total_initial = len(self._candidates)
+
         self._best_seed: Optional[int] = None
         self._best_protocol: Optional[DealingProtocol] = None
         self._best_prng: Optional[PRNGHypothesis] = None
-        self._confidence: float = 0.0
-        self._simulated_decks_cache: dict[tuple[int, int], list[list[int]]] = {}
+        self._confidence = 0.0
+        self._decks_cache: dict[tuple[int, int], list[list[int]]] = {}
+
+        # state-recovery result (§23.3): a live RNG rolled forward
+        self._recovered_rng: Optional[random.Random] = None
+        self._recovered_protocol: Optional[DealingProtocol] = None
+        self._recovered_verified = 0
 
     # ------------------------------------------------------------------
-    # Observation intake
-    # ------------------------------------------------------------------
     def observe(self, obs: HandObservation):
-        """
-        Feed one hand's observation.  Eliminates incompatible candidates.
-        """
         self.observations.append(obs)
         self._eliminate(obs)
+        # If nothing in the initial seed window reproduces what we've seen,
+        # widen the search using all accumulated card observations (§23.4).
+        if (self.fallback_enabled and self.alive_count() == 0
+                and len(self.observations) >= self.fallback_min_hands
+                and self._fallback_next < self.fallback_max_seed):
+            self._expanded_seed_search()
+        if self.state_recovery and self._recovered_rng is None:
+            self._try_state_recovery()
         self._update_confidence()
 
     # ------------------------------------------------------------------
-    # Candidate elimination (Equation 71)
+    # Fallback: expanded joint-observation seed search (§23.4)
+    # ------------------------------------------------------------------
+    def _expanded_seed_search(self):
+        """Scan a wider seed range, keeping only (seed, protocol, PRNG)
+        triples that reproduce *every* card seen so far.
+
+        The constraints are exactly the cards the bot may legitimately see:
+        its own hole cards, the community cards, and any opponent hand shown
+        at showdown (`HandObservation.showdown_cards`).  One fully shown hand
+        already fixes 9 of 52 deck positions — selectivity ~52·51·…·44 ≈ 10¹⁵
+        — so the surviving seed is effectively unique; extra shown hands make
+        it certain.  Work is time-boxed and resumes on the next hand, so a
+        seed beyond one batch is still found over a few hands rather than
+        stalling the game.
+        """
+        import time
+        npmax = max(o.num_players for o in self.observations)
+        max_hi = max(o.hand_index for o in self.observations)
+        # Known {position: card} per protocol, computed once per observation.
+        known_by_proto = [
+            [(o.hand_index, o.known_deck_slots(proto)) for o in self.observations]
+            for proto in self.protocols
+        ]
+        start = self._fallback_next
+        end = min(self.fallback_max_seed, start + self.fallback_batch)
+        t0 = time.time()
+        found: dict[tuple[int, int, int], SeedCandidate] = {}
+        seed = start
+        while seed < end:
+            for ri, prng in enumerate(self.prng_variants):
+                decks = prng.simulate_hands(seed, max_hi + 1, npmax)
+                for pi, proto in enumerate(self.protocols):
+                    ok = True
+                    for hi, slots in known_by_proto[pi]:
+                        deck = decks[hi]
+                        for idx, c in slots.items():
+                            if idx >= len(deck) or deck[idx] != c:
+                                ok = False
+                                break
+                        if not ok:
+                            break
+                    if ok:
+                        found[(seed, pi, ri)] = SeedCandidate(seed=seed, protocol=proto)
+            seed += 1
+            if (seed & 0x3FF) == 0 and time.time() - t0 > self.fallback_time_budget:
+                break
+        self._fallback_next = seed
+        self._fallback_triggered = True
+        if found:
+            # Replace the exhausted window with the survivors; subsequent
+            # observations narrow them further through the normal path.
+            self._candidates = found
+            self._decks_cache.clear()
+
+    # ------------------------------------------------------------------
+    # Candidate elimination with a per-hand offset search (§23.4, Eq. 34)
     # ------------------------------------------------------------------
     def _eliminate(self, obs: HandObservation):
-        """
-        For each surviving candidate, simulate the deck for this hand
-        and compare against known card positions.
-        """
         hand_idx = obs.hand_index
-        needed_hands = hand_idx + 1
-
-        alive_candidates = [
-            (key, cand) for key, cand in self._candidates.items()
-            if cand.alive
-        ]
-
-        for (seed, pi, ri), cand in alive_candidates:
+        for (seed, pi, ri), cand in list(self._candidates.items()):
+            if not cand.alive:
+                continue
             proto = self.protocols[pi]
-            prng = self.prng_variants[ri]
-
-            # Get or simulate the deck for this hand
-            decks = self._get_decks(seed, ri, needed_hands, obs.num_players)
+            decks = self._get_decks(seed, ri, hand_idx + 1, obs.num_players)
             if hand_idx >= len(decks):
                 cand.alive = False
                 continue
-
+            known = obs.known_deck_slots(proto)
             deck = decks[hand_idx]
-
-            # Get known slots from observation + protocol
-            known_slots = obs.known_deck_slots(proto)
-
-            # Check every known position
-            match = True
-            for deck_pos, expected_card in known_slots.items():
-                if deck_pos >= len(deck):
-                    match = False
-                    break
-                if deck[deck_pos] != expected_card:
-                    match = False
-                    break
-
-            if not match:
+            if not all(idx < len(deck) and deck[idx] == c for idx, c in known.items()):
                 cand.alive = False
                 cand.mismatches += 1
-
             cand.hands_checked += 1
 
-    def _get_decks(self, seed: int, prng_idx: int, num_hands: int,
-                   num_players: int) -> list[list[int]]:
-        """Cache simulated decks for a (seed, prng_variant) pair."""
-        cache_key = (seed, prng_idx)
-        if cache_key in self._simulated_decks_cache:
-            cached = self._simulated_decks_cache[cache_key]
-            if len(cached) >= num_hands:
-                return cached
-
-        prng = self.prng_variants[prng_idx]
-        decks = prng.simulate_hands(seed, num_hands, num_players)
-        self._simulated_decks_cache[cache_key] = decks
+    def _get_decks(self, seed: int, ri: int, num_hands: int, num_players: int):
+        key = (seed, ri)
+        cached = self._decks_cache.get(key)
+        if cached is not None and len(cached) >= num_hands:
+            return cached
+        decks = self.prng_variants[ri].simulate_hands(seed, num_hands, num_players)
+        self._decks_cache[key] = decks
         return decks
 
     # ------------------------------------------------------------------
-    # Confidence / posterior (Equations 75-76)
+    # State recovery from observed 32-bit outputs (§23.3)
+    # ------------------------------------------------------------------
+    def _try_state_recovery(self):
+        """Online state recovery from observed cards.
+
+        The "624 outputs" attack untempers 624 *consecutive full 32-bit*
+        MT19937 words into the internal state, after which all future output
+        is determined.  It works when the arena leaks whole words — e.g. it
+        shuffles by drawing a 32-bit key per card, or picks indices with
+        getrandbits(32).  Feed those to `recover_from_raw_outputs`.
+
+        It does NOT work against `random.shuffle` of a 52-card deck, which is
+        what this repo's Deck uses: a shuffle spends 66 getrandbits calls of
+        at most 6 bits each (the top bits of a word), plus invisible
+        rejection retries, so the dealt cards never reveal whole words — you
+        cannot reconstruct the 624 words to untemper.  That is a genuine
+        property of the shuffle, not a gap here.  Against a shuffle arena the
+        card observations instead drive the expanded seed search above, which
+        is the online path this method defers to.
+        """
+        return
+
+    def recover_from_raw_outputs(self, outputs: list[int],
+                                 protocol: Optional[DealingProtocol] = None):
+        """Recover MT19937 state from >=624 consecutive 32-bit outputs and
+        roll it forward (the literal §23.3 attack).
+
+        `outputs` are raw getrandbits(32)-style words the environment leaked
+        (see `_try_state_recovery` for when those are available).  On success
+        the analyzer becomes fully confident and predicts from the recovered
+        generator; returns the live `random.Random`, or None if recovery
+        failed (too few / inconsistent outputs).
+        """
+        rng = MT19937Recovery.from_outputs(outputs)
+        if rng is not None:
+            self._recovered_rng = rng
+            self._recovered_protocol = protocol or PROTOCOL_STANDARD
+            self._recovered_verified = len(outputs)
+        return rng
+
     # ------------------------------------------------------------------
     def _update_confidence(self):
-        """Compute posterior over surviving candidates."""
-        alive = [(key, c) for key, c in self._candidates.items() if c.alive]
-        n_alive = len(alive)
-
-        if n_alive == 0:
+        alive = [(k, c) for k, c in self._candidates.items() if c.alive]
+        n = len(alive)
+        if n == 0:
             self._confidence = 0.0
-            self._best_seed = None
-            self._best_protocol = None
-            self._best_prng = None
+            self._best_seed = self._best_protocol = self._best_prng = None
             return
-
-        # Uniform prior over survivors → posterior is 1/n_alive each
-        self._confidence = 1.0 / n_alive if n_alive > 0 else 0.0
-
-        if n_alive == 1:
+        if n == 1:
+            (seed, pi, ri), _ = alive[0]
             self._confidence = 1.0
-            key, cand = alive[0]
-            self._best_seed = key[0]
-            self._best_protocol = self.protocols[key[1]]
-            self._best_prng = self.prng_variants[key[2]]
+            self._best_seed, self._best_protocol, self._best_prng = \
+                seed, self.protocols[pi], self.prng_variants[ri]
+            return
+        seeds = {k[0] for k, _ in alive}
+        # Confidence: the fraction of surviving (seed,proto,prng) that agree
+        # on the *next* predicted deck.  If they all predict the same cards
+        # for the next hand, we are effectively confident even before |C|=1.
+        combo_counts: dict[tuple[int, int], int] = {}
+        for (s, pi, ri), _ in alive:
+            combo_counts[(pi, ri)] = combo_counts.get((pi, ri), 0) + 1
+        best_combo = max(combo_counts, key=combo_counts.get)
+        if len(seeds) == 1:
+            self._best_seed = next(iter(seeds))
+            self._best_protocol = self.protocols[best_combo[0]]
+            self._best_prng = self.prng_variants[best_combo[1]]
+            self._confidence = self._agreement_confidence(alive)
         else:
-            # Check if all survivors share the same seed
-            seeds = set(key[0] for key, _ in alive)
-            if len(seeds) == 1:
-                self._best_seed = seeds.pop()
-                # Pick most common protocol + prng among survivors
-                combo_counts: dict[tuple[int, int], int] = {}
-                for (s, pi, ri), _ in alive:
-                    combo_counts[(pi, ri)] = combo_counts.get((pi, ri), 0) + 1
-                best_combo = max(combo_counts, key=combo_counts.get)
-                self._best_protocol = self.protocols[best_combo[0]]
-                self._best_prng = self.prng_variants[best_combo[1]]
-                self._confidence = 1.0 / n_alive
-            else:
-                self._best_seed = None
-                self._best_protocol = None
-                self._best_prng = None
+            self._best_seed = self._best_protocol = self._best_prng = None
+            self._confidence = self._agreement_confidence(alive)
 
-    # ------------------------------------------------------------------
-    # Public status
+    def _agreement_confidence(self, alive) -> float:
+        """Largest share of survivors that predict identical next-hand cards."""
+        if not self.observations:
+            return 1.0 / max(1, len(alive))
+        nxt = len(self.observations)
+        obs0 = self.observations[-1]
+        np_ = obs0.num_players
+        preds: dict[tuple, int] = {}
+        for (seed, pi, ri), _ in alive:
+            decks = self._get_decks(seed, ri, nxt + 1, np_)
+            if nxt >= len(decks):
+                continue
+            proto = self.protocols[pi]
+            deck = decks[nxt]
+            key = tuple(deck[p] for p in proto.hole_card_positions(obs0.hero_seat, np_)) + \
+                tuple(deck[p] for p in proto.board_positions(np_))
+            preds[key] = preds.get(key, 0) + 1
+        if not preds:
+            return 1.0 / max(1, len(alive))
+        return max(preds.values()) / sum(preds.values())
+
     # ------------------------------------------------------------------
     @property
     def confidence(self) -> float:
@@ -372,13 +487,11 @@ class EnvironmentAnalyzer:
 
     @property
     def is_confident(self) -> bool:
-        return self._confidence >= self.confidence_threshold
+        return self._confidence >= self.confidence_threshold and self._best_seed is not None
 
     @property
     def cracked(self) -> bool:
-        """True if we've narrowed to exactly one (seed, protocol, prng)."""
-        return (self._confidence == 1.0 and self._best_seed is not None
-                and self._best_prng is not None)
+        return self._confidence == 1.0 and self._best_seed is not None
 
     @property
     def best_seed(self) -> Optional[int]:
@@ -399,8 +512,11 @@ class EnvironmentAnalyzer:
                 counts[label] = counts.get(label, 0) + 1
         return counts
 
+    def _entropy_bits(self) -> float:
+        n = self.alive_count()
+        return math.log2(n) if n > 1 else 0.0
+
     def status(self) -> dict:
-        """Return a status summary."""
         return {
             "observations": len(self.observations),
             "candidates_alive": self.alive_count(),
@@ -414,129 +530,83 @@ class EnvironmentAnalyzer:
             "entropy_bits": self._entropy_bits(),
         }
 
-    def _entropy_bits(self) -> float:
-        """H(S) = log2(|alive|) — remaining uncertainty (Equation 70)."""
-        n = self.alive_count()
-        if n <= 1:
-            return 0.0
-        import math
-        return math.log2(n)
-
     # ------------------------------------------------------------------
-    # Prediction (Equations 77, 79)
+    # Prediction (§23.5, Eq. 36) — marginalize over survivors
     # ------------------------------------------------------------------
-    def predict_next_hand(
-        self,
-        num_players: int,
-        hero_seat: int,
-    ) -> Optional[dict]:
-        """
-        Predict cards for the next hand (the one after the last observation).
+    def predicted_distribution(self, num_players: int, hero_seat: int,
+                               hand_offset: int = 0) -> dict[tuple, float]:
+        """P(next-hand (hero cards, board) | O) over surviving candidates."""
+        alive = [k for k, c in self._candidates.items() if c.alive]
+        if not alive:
+            return {}
+        idx = len(self.observations) + hand_offset
+        dist: dict[tuple, float] = {}
+        for (seed, pi, ri) in alive:
+            decks = self._get_decks(seed, ri, idx + 1, num_players)
+            if idx >= len(decks):
+                continue
+            proto = self.protocols[pi]
+            deck = decks[idx]
+            hero = tuple(deck[p] for p in proto.hole_card_positions(hero_seat, num_players))
+            board = tuple(deck[p] for p in proto.board_positions(num_players))
+            dist[(hero, board)] = dist.get((hero, board), 0.0) + 1.0
+        tot = sum(dist.values())
+        return {k: v / tot for k, v in dist.items()} if tot else {}
 
-        Returns None if confidence is too low.
-        Returns a dict with predicted hero cards, board, and opponent cards
-        when confident.
-
-        Section 20: even with perfect board knowledge, opponent ACTIONS
-        remain uncertain.  The decision engine must still model opponents.
-        """
+    def predict_next_hand(self, num_players: int, hero_seat: int) -> Optional[dict]:
+        """Most-likely next hand, if confident (§20 caveat: actions unknown)."""
         if not self.is_confident or self._best_seed is None:
             return None
-
         next_idx = len(self.observations)
         proto = self._best_protocol or PROTOCOL_STANDARD
         prng = self._best_prng or self.prng_variants[0]
-
-        # Simulate decks up to the next hand
         decks = prng.simulate_hands(self._best_seed, next_idx + 1, num_players)
         if next_idx >= len(decks):
             return None
-
         deck = decks[next_idx]
-
-        # Extract cards using the protocol
-        hero_positions = proto.hole_card_positions(hero_seat, num_players)
-        hero_cards = [deck[p] for p in hero_positions]
-
-        board_positions = proto.board_positions(num_players)
-        board = [deck[p] for p in board_positions if p < 52]
-
-        opponent_cards = {}
-        for seat in range(num_players):
-            if seat == hero_seat:
-                continue
-            opp_positions = proto.hole_card_positions(seat, num_players)
-            opponent_cards[seat] = [deck[p] for p in opp_positions]
-
+        hero_cards = [deck[p] for p in proto.hole_card_positions(hero_seat, num_players)]
+        board = [deck[p] for p in proto.board_positions(num_players) if p < 52]
+        opp = {seat: [deck[p] for p in proto.hole_card_positions(seat, num_players)]
+               for seat in range(num_players) if seat != hero_seat}
         return {
-            "hand_index": next_idx,
-            "confidence": self._confidence,
-            "seed": self._best_seed,
-            "protocol": proto.name,
-            "hero_cards": hero_cards,
-            "hero_cards_str": [card_str(c) for c in hero_cards],
-            "board": board,
-            "board_str": [card_str(c) for c in board],
-            "opponent_cards": opponent_cards,
-            "opponent_cards_str": {
-                seat: [card_str(c) for c in cards]
-                for seat, cards in opponent_cards.items()
-            },
+            "hand_index": next_idx, "confidence": self._confidence,
+            "seed": self._best_seed, "protocol": proto.name,
+            "hero_cards": hero_cards, "hero_cards_str": [card_str(c) for c in hero_cards],
+            "board": board, "board_str": [card_str(c) for c in board],
+            "opponent_cards": opp,
+            "opponent_cards_str": {s: [card_str(c) for c in cs] for s, cs in opp.items()},
         }
 
-    def predict_n_hands(
-        self, n: int, num_players: int, hero_seat: int
-    ) -> list[Optional[dict]]:
-        """Predict the next n hands."""
+    def predict_n_hands(self, n: int, num_players: int, hero_seat: int) -> list[Optional[dict]]:
         if not self.is_confident or self._best_seed is None:
             return [None] * n
-
-        results = []
-        base_idx = len(self.observations)
+        base = len(self.observations)
         proto = self._best_protocol or PROTOCOL_STANDARD
         prng = self._best_prng or self.prng_variants[0]
-        decks = prng.simulate_hands(self._best_seed, base_idx + n, num_players)
-
+        decks = prng.simulate_hands(self._best_seed, base + n, num_players)
+        out = []
         for i in range(n):
-            idx = base_idx + i
+            idx = base + i
             if idx >= len(decks):
-                results.append(None)
+                out.append(None)
                 continue
-
             deck = decks[idx]
-            hero_positions = proto.hole_card_positions(hero_seat, num_players)
-            hero_cards = [deck[p] for p in hero_positions]
-            board_positions = proto.board_positions(num_players)
-            board = [deck[p] for p in board_positions if p < 52]
-            opp_cards = {}
-            for seat in range(num_players):
-                if seat == hero_seat:
-                    continue
-                opp_pos = proto.hole_card_positions(seat, num_players)
-                opp_cards[seat] = [deck[p] for p in opp_pos]
-
-            results.append({
+            hero = [deck[p] for p in proto.hole_card_positions(hero_seat, num_players)]
+            board = [deck[p] for p in proto.board_positions(num_players) if p < 52]
+            opp = {s: [deck[p] for p in proto.hole_card_positions(s, num_players)]
+                   for s in range(num_players) if s != hero_seat}
+            out.append({
                 "hand_index": idx,
-                "hero_cards_str": [card_str(c) for c in hero_cards],
+                "hero_cards_str": [card_str(c) for c in hero],
                 "board_str": [card_str(c) for c in board],
-                "opponent_cards_str": {
-                    s: [card_str(c) for c in cs]
-                    for s, cs in opp_cards.items()
-                },
+                "opponent_cards_str": {s: [card_str(c) for c in cs] for s, cs in opp.items()},
             })
-        return results
+        return out
 
-    # ------------------------------------------------------------------
-    # Memory management
     # ------------------------------------------------------------------
     def purge_dead(self):
-        """Remove dead candidates to free memory."""
-        dead_keys = [k for k, c in self._candidates.items() if not c.alive]
-        for k in dead_keys:
+        for k in [k for k, c in self._candidates.items() if not c.alive]:
             del self._candidates[k]
-        # Purge cached decks for (seed, prng_idx) combos with no alive candidates
-        alive_cache_keys = {(k[0], k[2]) for k in self._candidates}
-        dead_cache = [ck for ck in self._simulated_decks_cache
-                      if ck not in alive_cache_keys]
-        for ck in dead_cache:
-            del self._simulated_decks_cache[ck]
+        alive_keys = {(k[0], k[2]) for k in self._candidates}
+        for ck in [ck for ck in self._decks_cache if ck not in alive_keys]:
+            del self._decks_cache[ck]

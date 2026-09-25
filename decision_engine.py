@@ -1,518 +1,490 @@
 """
-Decision Engine
-===============
-Implements the core action-value estimation from Section 17:
+Decision Engine  (design doc §20)
+=================================
+For each legal action a:
 
-    Q(s, a) = EV(a | s, M1, ..., Mn)           (Equation 60)
+    Q(s, a) = Σ_r P(r | a, s, M) · E[ U(outcome | a, r, s) ] − U(now)
 
-For Phase 2, opponent models M_i are replaced with default assumptions
-(population priors). The engine evaluates every legal action and returns
-Q-values suitable for the strategy controller's softmax selection.
+where r ranges over the opponents' responses and the inner expectation is
+estimated by Monte Carlo over joint (opponent hands, runout) samples.
 
-Action decomposition (Equation 62):
-    EV(a) = EV_pot + EV_future + EV_fold_equity - EV_risk
+Why this replaces the original decomposition
+--------------------------------------------
+The original engine computed EV_pot + EV_future + EV_fold_eq − EV_risk,
+plus hand-tuned bonuses (implied odds, position, "hero call boost", SPR
+adjustments) and a risk multiplier.  §20 points out two problems: fold
+equity was counted twice, and subtracting a risk term means the result is
+no longer an expected value.  Here every term is accounted for exactly
+once:
 
-Key components:
-  - pot odds & immediate call EV
-  - fold equity for bets/raises
-  - bet-size evaluation across multiple sizes
-  - SPR-aware adjustments
-  - position-based adjustments
+* Opponent responses are partitioned disjointly (fold / call / raise, or
+  check / bet), with per-combo probabilities from the calibrated
+  action-likelihood model (§12), so fold equity *is* the fold branch of the
+  response sum.  The calling range is automatically stronger than the full
+  range because weak combos carry the fold probability.
+* Variance is handled by the utility U (chip-linear, concave, or ICM),
+  not by a penalty (§8, §20).
+* Raises facing hero's bet (heads-up) and bets after hero checks are
+  followed one step: hero best-responds (call or fold) using the same
+  samples restricted to the villain combos that take that line.
+
+Other corrections:
+
+* Raise sizing: when hero raises, the villain calls the difference between
+  hero's total and the villain's current commitment, not hero's full cost.
+  The old `pot + 2·cost` overstated the called pot for every raise.
+* Multi-way: opponents respond independently; responses are sampled with
+  common random numbers so different bet sizes are compared on the same
+  deals.  Ties split 1/k.
+* Optional environment feature (§24): a predicted runout enters only as a
+  second Q estimate blended in with weight = the environment confidence.
+
+Terminal values are showdown values; betting on later streets beyond the
+single modeled response is not simulated.
 """
 
 from __future__ import annotations
-import math
-from dataclasses import dataclass
-from typing import Optional
+import random
+from dataclasses import dataclass, field
+from typing import Optional, Sequence
 
 from game_state import GameState, ActionType, LegalAction, Street, Position
-from equity import monte_carlo_equity, break_even_equity, call_ev, bluff_ev
-from board_texture import analyze_board, BoardTexture
+from equity import sample_showdowns, normalize_range, break_even_equity, ShowdownTrial
+from board_texture import analyze_board
+from hand_strength import strength_table
+from opponent_model import OpponentModel, decision_cell
+from action_likelihood import ActionLikelihoodModel, DEFAULT_LIKELIHOOD_MODEL
+from utility import make_utility, Utility
 
 
 # ---------------------------------------------------------------------------
-# Configuration — tunable constants for Phase 2 (no opponent model yet)
+# Configuration
 # ---------------------------------------------------------------------------
 @dataclass
 class EVConfig:
-    """Knobs for the EV engine. Will be overridden by opponent models later."""
-    # Monte Carlo simulations per decision
-    equity_simulations: int = 5_000
-    equity_simulations_important: int = 15_000  # for large-pot decisions
+    """Knobs for the EV engine."""
+    equity_simulations: int = 600
+    equity_simulations_important: int = 1200
+    important_pot_bb: float = 20.0
 
-    # Default fold-probability estimates (population prior, no opponent model)
+    # Hero bet/raise sizes, as fractions of the pot after calling.
+    bet_sizes: tuple = (0.33, 0.50, 0.75, 1.0, 1.5)
+    # Villain bet size (fraction of pot) when their sizing is unknown.
+    villain_bet_size: float = 0.66
+    # Villain raise size (fraction of pot) when hero is raised.
+    villain_raise_size: float = 1.0
+
+    # Utility: "chips" (cash), "log" (concave), "icm" (tournament).
+    utility: str = "chips"
+    payouts: tuple = (0.5, 0.3, 0.2)
+
+    # --- Deprecated (kept so old configs still construct) --------------
+    # Fold rates now come from opponent models / the calibrated likelihood
+    # model; risk is handled by the utility.  These are not used in Q.
     fold_to_bet_default: float = 0.40
     fold_to_raise_default: float = 0.50
     fold_to_allin_default: float = 0.60
-
-    # Fold probability scaling by bet size (fraction of pot)
-    # Larger bets → higher fold probability
-    fold_size_slope: float = 0.30  # extra fold% per pot-sized bet
-
-    # Position bonus (IP advantage, in BB)
-    ip_bonus_bb: float = 0.5
-
-    # SPR thresholds
-    low_spr_threshold: float = 4.0
-    high_spr_threshold: float = 12.0
-
-    # Bluff threshold: don't bluff if equity > this (you have a value hand)
-    bluff_equity_ceiling: float = 0.35
-    # Value threshold: consider value betting above this
-    value_equity_floor: float = 0.55
-
-    # Risk aversion for tournament play (1.0 = chip-neutral, <1 = risk-averse)
     risk_factor: float = 1.0
-
-    # Bet sizes to evaluate (as fractions of pot)
-    bet_sizes: tuple = (0.33, 0.50, 0.75, 1.0)
+    bluff_equity_ceiling: float = 0.35     # used only for labelling
+    value_equity_floor: float = 0.55       # used only for labelling
 
 
 DEFAULT_CONFIG = EVConfig()
 
 
-# ---------------------------------------------------------------------------
-# ActionEV — what the engine returns for each candidate action
-# ---------------------------------------------------------------------------
 @dataclass
 class ActionEV:
-    """Expected value breakdown for a single action."""
+    """Expected value for a single candidate action."""
     action_type: ActionType
-    amount: int           # total chips for this action (0 for fold/check)
-    ev: float             # estimated EV in chips
-    ev_components: dict   # breakdown for debugging
-    label: str = ""       # human-readable description
+    amount: int           # BET/RAISE/ALL_IN: street total; CALL: chips added
+    ev: float             # Q(s, a) in utility units (chips for ChipUtility)
+    ev_components: dict = field(default_factory=dict)
+    label: str = ""
 
 
 # ---------------------------------------------------------------------------
-# Main engine
+# Engine
 # ---------------------------------------------------------------------------
 class DecisionEngine:
-    """
-    Evaluates Q(s, a) for all legal actions in a given game state.
+    """Evaluates Q(s, a) for every legal action.
 
-    Usage:
         engine = DecisionEngine()
-        results = engine.evaluate(game_state, hero=0)
-        # results is a list of ActionEV sorted by EV descending
+        results = engine.evaluate(gs, hero=0, opponent_ranges=..., models=...)
     """
 
-    def __init__(self, config: EVConfig = DEFAULT_CONFIG):
+    def __init__(self, config: EVConfig = DEFAULT_CONFIG,
+                 likelihood_model: Optional[ActionLikelihoodModel] = None):
         self.config = config
+        self.lm = likelihood_model or DEFAULT_LIKELIHOOD_MODEL
+        self.utility: Utility = make_utility(config.utility, config.payouts)
 
+    # ------------------------------------------------------------------
     def evaluate(
         self,
         gs: GameState,
         hero: int,
         opponent_ranges: Optional[list] = None,
         rng_seed: Optional[int] = None,
-        exploit_profile: Optional["ExploitProfile"] = None,
+        exploit_profile=None,
+        models: Optional[dict[int, OpponentModel]] = None,
+        exploit_profiles: Optional[dict] = None,
+        predicted_runout: Optional[Sequence[int]] = None,
+        runout_weight: float = 0.0,
+        positions: Optional[list[str]] = None,
+        prev_aggressor: Optional[int] = None,
     ) -> list[ActionEV]:
         """
-        Evaluate all legal actions for `hero` in the current game state.
-        Returns a list of ActionEV sorted by EV (best first).
+        Q-values for every legal action, best first.
 
-        exploit_profile: Phase 5 per-opponent overrides for fold estimates,
-                         bluff/value thresholds, and bet sizing.
+        opponent_ranges : one range per *live* opponent in seat order
+            (RangeTracker.get_ranges_for_equity()); None = random hands.
+        models : {seat: OpponentModel} for response probabilities.
+        exploit_profiles : {seat: ExploitProfile} supplying confidence-
+            scaled fold frequencies (the MDF loop, §22).  `exploit_profile`
+            (single) is accepted for backward compatibility and applied to
+            every opponent.
+        predicted_runout, runout_weight : optional environment feature (§24).
         """
         legal = gs.get_legal_actions(hero)
         if not legal:
             return []
+        ctx = _Context(self, gs, hero, opponent_ranges, rng_seed, models or {},
+                       exploit_profiles or {}, exploit_profile, positions,
+                       prev_aggressor)
 
-        ep = exploit_profile  # shorthand
+        results = self._evaluate_all(ctx, legal)
 
-        # --- compute equity once (reused across all action evaluations) ---
-        num_opp = len(gs.active_players) - 1
-        if num_opp < 1:
-            num_opp = 1
+        # Environment feature: blend in Q under the predicted runout.
+        if (predicted_runout and runout_weight > 0 and gs.street < Street.RIVER):
+            need = 5 - len(gs.board)
+            run = list(predicted_runout)[:need]
+            known = set(gs.hole_cards[hero]) | set(gs.board)
+            if len(run) == need and not (set(run) & known):
+                ctx_p = _Context(self, gs, hero, opponent_ranges, rng_seed, models or {},
+                                 exploit_profiles or {}, exploit_profile, positions,
+                                 prev_aggressor, fixed_runout=run)
+                pred = {(r.action_type, r.amount): r.ev
+                        for r in self._evaluate_all(ctx_p, legal)}
+                w = min(max(runout_weight, 0.0), 1.0)
+                for r in results:
+                    q_pred = pred.get((r.action_type, r.amount), r.ev)
+                    r.ev_components["ev_predicted_runout"] = round(q_pred, 2)
+                    r.ev_components["runout_weight"] = round(w, 3)
+                    r.ev = (1 - w) * r.ev + w * q_pred
 
-        # Use more simulations for larger pots
-        pot_significance = gs.pot / gs.big_blind if gs.big_blind > 0 else 1
-        n_sims = (self.config.equity_simulations_important
-                  if pot_significance > 20
-                  else self.config.equity_simulations)
-
-        eq_result = monte_carlo_equity(
-            hero_cards=gs.hole_cards[hero],
-            board=gs.board,
-            num_opponents=num_opp,
-            num_simulations=n_sims,
-            opponent_ranges=opponent_ranges,
-            rng_seed=rng_seed,
-        )
-        equity = eq_result["equity"]
-
-        # --- board texture ---
-        bt = analyze_board(gs.board)
-
-        # --- SPR ---
-        hero_stack = gs.stacks[hero]
-        spr = hero_stack / gs.pot if gs.pot > 0 else float('inf')
-
-        # --- position ---
-        hero_pos = gs.positions[hero]
-        in_position = self._is_in_position(gs, hero)
-
-        # --- evaluate each legal action ---
-        results: list[ActionEV] = []
-        for la in legal:
-            aev = self._evaluate_action(
-                gs, hero, la, equity, bt, spr, in_position, hero_stack, ep
-            )
-            results.append(aev)
-
-        # If BET or RAISE is legal, also evaluate multiple bet sizes
-        bet_sizes = ep.preferred_bet_sizes if ep else self.config.bet_sizes
-        for la in legal:
-            if la.action_type in (ActionType.BET, ActionType.RAISE):
-                size_evs = self._evaluate_bet_sizes(
-                    gs, hero, la, equity, bt, spr, in_position, hero_stack, ep
-                )
-                results.extend(size_evs)
-
-        # Sort by EV descending
         results.sort(key=lambda x: x.ev, reverse=True)
         return results
 
-    # ------------------------------------------------------------------
-    # Per-action evaluation
-    # ------------------------------------------------------------------
-    def _evaluate_action(
-        self, gs, hero, la: LegalAction, equity, bt, spr, in_position, stack,
-        ep=None,
-    ) -> ActionEV:
-        """Compute EV for a single legal action."""
-        pot = gs.pot
-        to_call = gs.max_current_bet - gs.current_bets[hero]
-
-        if la.action_type == ActionType.FOLD:
-            return ActionEV(
-                action_type=ActionType.FOLD,
-                amount=0,
-                ev=0.0,
-                ev_components={"reason": "fold — no further investment"},
-                label="Fold",
-            )
-
-        elif la.action_type == ActionType.CHECK:
-            initiative_discount = 0.90 if not in_position else 0.95
-            ev_check = equity * pot * initiative_discount
-            if bt.wetness > 0.4 and equity > 0.6:
-                ev_check *= 0.85
-            return ActionEV(
-                action_type=ActionType.CHECK,
-                amount=0,
-                ev=ev_check,
-                ev_components={
-                    "equity": equity, "pot": pot,
-                    "initiative_discount": initiative_discount,
-                    "wetness_penalty": bt.wetness > 0.4 and equity > 0.6,
-                },
-                label="Check",
-            )
-
-        elif la.action_type == ActionType.CALL:
-            call_cost = min(to_call, stack)
-            ev_immediate = call_ev(equity, pot, call_cost)
-
-            # Phase 5: adjust calling threshold using exploit profile
-            call_adjust = ep.call_threshold_adjust if ep else 0.0
-            hero_call_boost = ep.hero_call_boost if ep else 0.0
-
-            # Implied odds adjustment
-            implied_bonus = 0.0
-            if gs.street < Street.RIVER:
-                if equity < 0.5 and equity > 0.2:
-                    implied_multiplier = min(spr * 0.05, 0.3)
-                    implied_bonus = implied_multiplier * call_cost
-
-            reverse_implied = 0.0
-            if equity > 0.4 and equity < 0.6 and spr > self.config.high_spr_threshold:
-                reverse_implied = 0.1 * call_cost
-
-            pos_bonus = self.config.ip_bonus_bb * gs.big_blind if in_position else 0.0
-
-            # Phase 5: hero call boost from opponent bluff frequency
-            call_boost_chips = hero_call_boost * pot
-
-            ev_total = (ev_immediate + implied_bonus - reverse_implied
-                        + pos_bonus + call_boost_chips
-                        - call_adjust * call_cost)
-            ev_total *= self.config.risk_factor
-
-            return ActionEV(
-                action_type=ActionType.CALL,
-                amount=call_cost,
-                ev=ev_total,
-                ev_components={
-                    "equity": equity, "pot": pot, "call_cost": call_cost,
-                    "ev_immediate": ev_immediate,
-                    "implied_bonus": implied_bonus,
-                    "reverse_implied": reverse_implied,
-                    "pos_bonus": pos_bonus,
-                    "break_even": break_even_equity(call_cost, pot),
-                },
-                label=f"Call {call_cost}",
-            )
-
-        elif la.action_type in (ActionType.BET, ActionType.RAISE):
-            return self._evaluate_bet(
-                gs, hero, la, la.min_amount, equity, bt, spr, in_position, stack, ep
-            )
-
-        elif la.action_type == ActionType.ALL_IN:
-            return self._evaluate_bet(
-                gs, hero, la, stack + gs.current_bets[hero],
-                equity, bt, spr, in_position, stack, ep
-            )
-
-        return ActionEV(
-            action_type=la.action_type, amount=0, ev=0.0,
-            ev_components={}, label="Unknown"
-        )
+    def _evaluate_all(self, ctx: "_Context", legal: list[LegalAction]) -> list[ActionEV]:
+        out: list[ActionEV] = []
+        for la in legal:
+            if la.action_type == ActionType.FOLD:
+                out.append(ActionEV(ActionType.FOLD, 0, 0.0,
+                                    {"reason": "no further investment"}, "Fold"))
+            elif la.action_type == ActionType.CHECK:
+                out.append(ctx.q_check())
+            elif la.action_type == ActionType.CALL:
+                out.append(ctx.q_call(la.min_amount))
+            elif la.action_type in (ActionType.BET, ActionType.RAISE):
+                for total in ctx.candidate_totals(la):
+                    out.append(ctx.q_bet(la.action_type, total))
+            elif la.action_type == ActionType.ALL_IN:
+                out.append(ctx.q_bet(ActionType.ALL_IN, la.max_amount))
+        # An all-in shove as an explicit option whenever raising is legal
+        for la in legal:
+            if la.action_type in (ActionType.BET, ActionType.RAISE) and la.max_amount > la.min_amount:
+                if not any(r.amount == la.max_amount and r.action_type == la.action_type for r in out):
+                    out.append(ctx.q_bet(la.action_type, la.max_amount))
+        return out
 
     # ------------------------------------------------------------------
-    # Bet / raise evaluation
-    # ------------------------------------------------------------------
-    def _evaluate_bet(
-        self, gs, hero, la, bet_total, equity, bt, spr, in_position, stack,
-        ep=None,
-    ) -> ActionEV:
-        """
-        Evaluate a specific bet/raise amount.
-        Phase 5: uses exploit_profile for fold estimates and thresholds.
-        """
-        pot = gs.pot
-        cost = bet_total - gs.current_bets[hero]
-        cost = min(cost, stack)
-
-        if pot > 0:
-            bet_fraction = cost / pot
-        else:
-            bet_fraction = 1.0
-
-        # Phase 5: use exploit profile fold estimates when available
-        if ep and ep.confidence > 0:
-            base_fold = self._exploit_fold_probability(
-                la.action_type, bet_fraction, ep
-            )
-        else:
-            base_fold = self._estimate_fold_probability(la.action_type, bet_fraction)
-
-        # Board texture adjustment
-        fold_prob = base_fold * (1.0 - 0.2 * bt.wetness)
-        fold_prob = max(0.05, min(0.90, fold_prob))
-
-        new_pot = pot + 2 * cost
-        ev_when_called = equity * new_pot - cost
-
-        ev_bet = fold_prob * pot + (1 - fold_prob) * ev_when_called
-
-        spr_adj = self._spr_adjustment(spr, equity, la.action_type)
-        ev_bet += spr_adj
-
-        if in_position:
-            ev_bet += self.config.ip_bonus_bb * gs.big_blind * 0.5
-
-        ev_bet *= self.config.risk_factor
-
-        # Phase 5: bluff/value classification from exploit profile
-        bluff_ceil = ep.bluff_equity_ceiling if ep else self.config.bluff_equity_ceiling
-        value_floor = ep.value_equity_floor if ep else self.config.value_equity_floor
-
-        if equity < bluff_ceil:
-            label_type = "Bluff"
-            # Phase 5: cap bluff EV if above bluff frequency cap
-            if ep and ep.bluff_frequency_cap < 0.20:
-                ev_bet *= 0.7  # discourage bluffing vs calling stations
-        elif equity > value_floor:
-            label_type = "Value"
-        else:
-            label_type = "Thin-value"
-
-        action_name = ActionType(la.action_type).name
-        pct = int(bet_fraction * 100) if pot > 0 else 0
-
-        return ActionEV(
-            action_type=la.action_type,
-            amount=bet_total,
-            ev=ev_bet,
-            ev_components={
-                "equity": equity, "pot": pot, "cost": cost,
-                "bet_fraction_of_pot": round(bet_fraction, 2),
-                "fold_probability": round(fold_prob, 3),
-                "ev_when_called": round(ev_when_called, 1),
-                "ev_fold_component": round(fold_prob * pot, 1),
-                "spr_adjustment": round(spr_adj, 1),
-                "bet_type": label_type,
-            },
-            label=f"{action_name} {bet_total} ({pct}% pot, {label_type})",
-        )
-
-    def _evaluate_bet_sizes(
-        self, gs, hero, la, equity, bt, spr, in_position, stack, ep=None,
-    ) -> list[ActionEV]:
-        """Evaluate multiple bet sizes from config or exploit profile."""
-        results = []
-        pot = gs.pot
-        if pot <= 0:
-            return results
-
-        sizes = ep.preferred_bet_sizes if ep and ep.confidence > 0.3 else self.config.bet_sizes
-        for frac in sizes:
-            bet_chips = int(pot * frac)
-            # Compute total bet this street
-            bet_total = gs.current_bets[hero] + bet_chips
-
-            # Clamp to legal range
-            if bet_total < la.min_amount:
-                continue  # below minimum
-            if bet_total > la.max_amount:
-                bet_total = la.max_amount  # cap at all-in
-
-            # Skip if this duplicates the min-amount evaluation
-            if bet_total == la.min_amount:
-                continue
-
-            aev = self._evaluate_bet(
-                gs, hero, la, bet_total, equity, bt, spr, in_position, stack, ep
-            )
-            results.append(aev)
-
-        return results
-
-    # ------------------------------------------------------------------
-    # Fold probability estimation (population prior — Phase 2)
-    # ------------------------------------------------------------------
-    def _estimate_fold_probability(
-        self, action_type: ActionType, bet_fraction: float
-    ) -> float:
-        """
-        Estimate opponent fold probability given bet size.
-        Phase 2 uses population defaults; Phase 3+ uses per-opponent models.
-
-        Larger bets → higher fold probability, with diminishing returns.
-        """
-        if action_type == ActionType.ALL_IN:
-            base = self.config.fold_to_allin_default
-        elif action_type == ActionType.RAISE:
-            base = self.config.fold_to_raise_default
-        else:
-            base = self.config.fold_to_bet_default
-
-        # Scale by bet size: log curve (diminishing returns on huge bets)
-        if bet_fraction > 0:
-            size_factor = self.config.fold_size_slope * math.log1p(bet_fraction)
-        else:
-            size_factor = 0.0
-
-        fold_prob = base + size_factor
-        return max(0.05, min(0.90, fold_prob))
-
-    def _exploit_fold_probability(
-        self, action_type: ActionType, bet_fraction: float,
-        ep: "ExploitProfile",
-    ) -> float:
-        """
-        Phase 5: Fold probability from learned opponent stats.
-        Uses the actual observed fold rates from the exploit profile,
-        scaled by bet size.
-        """
-        if action_type == ActionType.ALL_IN:
-            base = ep.fold_to_allin
-        elif action_type == ActionType.RAISE:
-            base = ep.fold_to_raise
-        else:
-            base = ep.fold_to_bet
-
-        # Scale by bet size (bigger bets → higher fold prob), but
-        # anchored to the opponent's actual observed rate
-        if bet_fraction > 0:
-            size_factor = 0.15 * math.log1p(bet_fraction)
-        else:
-            size_factor = 0.0
-
-        fold_prob = base + size_factor
-        return max(0.05, min(0.90, fold_prob))
-
-    # ------------------------------------------------------------------
-    # SPR-aware adjustment (Section 7)
-    # ------------------------------------------------------------------
-    def _spr_adjustment(
-        self, spr: float, equity: float, action_type: ActionType
-    ) -> float:
-        """
-        Adjust EV based on stack-to-pot ratio.
-
-        Low SPR:
-          - Strong hands gain (commit stacks profitably)
-          - Weak hands lose (can't maneuver, get pot-committed)
-
-        High SPR:
-          - Drawing hands gain (room to realize implied odds)
-          - Marginal made hands lose (hard to play multi-street)
-        """
-        adj = 0.0
-        if spr < self.config.low_spr_threshold:
-            # Low SPR: showdown strength matters most
-            if equity > 0.6:
-                # Strong hand in low SPR → push value, bonus
-                adj = (0.7 - spr / self.config.low_spr_threshold) * 5.0
-            elif equity < 0.3:
-                # Weak hand in low SPR → bluffs are expensive, penalty
-                adj = -(0.7 - spr / self.config.low_spr_threshold) * 3.0
-
-        elif spr > self.config.high_spr_threshold:
-            # High SPR: implied odds matter, marginal hands risky
-            if equity > 0.4 and equity < 0.6:
-                # Marginal hand deep-stacked → reverse implied odds danger
-                adj = -2.0
-            elif equity < 0.35 and equity > 0.15:
-                # Drawing hand deep → implied odds bonus
-                adj = 1.5
-
-        return adj
-
-    # ------------------------------------------------------------------
-    # Position detection
-    # ------------------------------------------------------------------
-    def _is_in_position(self, gs: GameState, hero: int) -> bool:
-        """
-        Determine if hero acts last post-flop among active players.
-        In position = informational advantage.
-        """
-        if gs.street == Street.PREFLOP:
-            # Preflop position is complex; approximate: BTN/CO/HJ = late
-            return gs.positions[hero] in (Position.BTN, Position.CO, Position.HJ)
-
-        # Post-flop: in position = last to act among non-folded players
-        active = gs.active_players
-        if not active:
-            return False
-
-        # Find who acts last (closest to dealer going clockwise)
-        n = gs.num_players
-        last_seat = -1
-        for offset in range(n, 0, -1):
-            seat = (gs.dealer_seat + offset) % n
-            if seat in active and not gs.all_in[seat]:
-                last_seat = seat
-                break
-
-        return hero == last_seat
-
-    # ------------------------------------------------------------------
-    # Convenience: best action
-    # ------------------------------------------------------------------
-    def best_action(
-        self,
-        gs: GameState,
-        hero: int,
-        opponent_ranges=None,
-        rng_seed=None,
-    ) -> ActionEV:
-        """Return the single highest-EV action."""
-        results = self.evaluate(gs, hero, opponent_ranges, rng_seed)
+    def best_action(self, gs: GameState, hero: int, opponent_ranges=None,
+                    rng_seed=None, **kw) -> ActionEV:
+        results = self.evaluate(gs, hero, opponent_ranges, rng_seed, **kw)
         if not results:
             return ActionEV(ActionType.FOLD, 0, 0.0, {}, "Fold (no legal actions)")
         return results[0]
+
+    @staticmethod
+    def _is_in_position(gs: GameState, hero: int) -> bool:
+        if gs.street == Street.PREFLOP:
+            return gs.positions[hero] in (Position.BTN, Position.CO, Position.HJ)
+        n = gs.num_players
+        for offset in range(n, 0, -1):
+            seat = (gs.dealer_seat + offset) % n
+            if not gs.folded[seat] and not gs.all_in[seat]:
+                return seat == hero
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Per-decision context: samples, responses, utility bookkeeping
+# ---------------------------------------------------------------------------
+class _Context:
+    def __init__(self, engine: DecisionEngine, gs: GameState, hero: int,
+                 opponent_ranges, rng_seed, models, profiles, single_profile,
+                 positions, prev_aggressor, fixed_runout=None):
+        self.e = engine
+        self.cfg = engine.config
+        self.gs = gs
+        self.hero = hero
+        self.models = models
+        self.profiles = profiles
+        self.single_profile = single_profile
+        self.positions = positions or [p.name for p in gs.positions]
+        self.prev_aggressor = prev_aggressor
+
+        self.opps = [s for s in gs.active_players if s != hero]
+        m = len(self.opps)
+        ranges = list(opponent_ranges or [])
+        if len(ranges) > m:
+            ranges = ranges[:m]
+        ranges += [None] * (m - len(ranges))
+        self.ranges = ranges
+
+        self.hero_cards = list(gs.hole_cards[hero])
+        self.board = list(gs.board)
+        self.pot = gs.pot
+        self.committed = gs.current_bets[hero]
+        self.stack = gs.stacks[hero]
+        self.bet_before = gs.max_current_bet
+        self.to_call = min(self.bet_before - self.committed, self.stack)
+        self.bb = gs.big_blind
+
+        n = (self.cfg.equity_simulations_important
+             if gs.pot / max(1, gs.big_blind) > self.cfg.important_pot_bb
+             else self.cfg.equity_simulations)
+        self.rng = random.Random(rng_seed)
+        self.trials: list[ShowdownTrial] = sample_showdowns(
+            self.hero_cards, self.board, m, n, ranges, rng=self.rng,
+            fixed_runout=fixed_runout) if m > 0 else []
+        self.N = max(1, len(self.trials))
+        # common random numbers for multi-way response sampling
+        self.u = [[self.rng.random() for _ in range(m)] for _ in self.trials]
+        self.share_all = [t.hero_share() for t in self.trials]
+        self.equity = sum(self.share_all) / self.N if self.trials else 1.0
+
+        dead = set(self.hero_cards)
+        self.strengths = strength_table(self.board, dead)
+        self.weights = []
+        for i in range(m):
+            w = normalize_range(ranges[i], dead | set(self.board))
+            self.weights.append(w if w else {h: 1.0 for h in self.strengths})
+
+        # utility bookkeeping
+        self.stacks_ref = list(gs.starting_stacks) if gs.starting_stacks else \
+            [gs.stacks[i] + gs.current_bets[i] for i in range(gs.num_players)]
+        # stacks_ref[hero] must be comparable with hero_final values
+        self.hero_base = self.stack
+        self.stacks_ref = list(self.stacks_ref)
+        self.stacks_ref[hero] = self.stack
+        self._ucache: dict[float, float] = {}
+        self.u0 = self.U(self.stack)
+        self.pot_scale = self.e.utility.pot_scale(self.stack, self.pot, hero,
+                                                  self.stacks_ref, self.opps)
+        self.in_position = DecisionEngine._is_in_position(gs, hero)
+
+    # --- utility ---------------------------------------------------------
+    def U(self, hero_final: float) -> float:
+        k = round(hero_final, 3)
+        v = self._ucache.get(k)
+        if v is None:
+            v = self.e.utility.value(hero_final, self.hero, self.stacks_ref, self.opps)
+            self._ucache[k] = v
+        return v
+
+    def _can_act(self, seat: int) -> bool:
+        return not self.gs.all_in[seat] and not self.gs.folded[seat]
+
+    def _profile(self, seat: int):
+        return self.profiles.get(seat) or self.single_profile
+
+    def _cell(self, seat: int, facing: bool, raises_before: int):
+        pos = self.positions[seat] if seat < len(self.positions) else "MP"
+        return decision_cell(self.gs.street, pos, self.board,
+                             self.prev_aggressor == seat, facing, raises_before)
+
+    # --- actions ---------------------------------------------------------
+    def candidate_totals(self, la: LegalAction) -> list[int]:
+        """Street totals for hero bets/raises: min, pot fractions, all-in."""
+        base = self.bet_before
+        pot_after_call = self.pot + self.to_call
+        totals = {la.min_amount}
+        for f in self.cfg.bet_sizes:
+            t = int(round(base + f * pot_after_call))
+            if la.min_amount <= t <= la.max_amount:
+                totals.add(t)
+        return sorted(totals)
+
+    def q_call(self, call_amt: int) -> ActionEV:
+        c = min(call_amt, self.stack)
+        pot_final = self.pot + c
+        q = sum(self.U(self.stack - c + s * pot_final) for s in self.share_all) / self.N - self.u0
+        return ActionEV(ActionType.CALL, c, q, {
+            "equity": round(self.equity, 4), "pot": self.pot, "call_cost": c,
+            "break_even": round(break_even_equity(c, self.pot), 4),
+            "ev_immediate": round(self.equity * pot_final - c, 2),
+        }, f"Call {c}")
+
+    def q_check(self) -> ActionEV:
+        """Check; if an opponent is still to act, model their bet and hero's reply."""
+        to_act = [s for s in self._seats_after_hero()
+                  if s in self.gs.needs_to_act and self._can_act(s)]
+        showdown = [self.U(self.stack + s * self.pot) - self.u0 for s in self.share_all]
+        if not to_act or not self.trials:
+            q = sum(showdown) / self.N
+            return ActionEV(ActionType.CHECK, 0, q,
+                            {"equity": round(self.equity, 4), "pot": self.pot,
+                             "villain_bet_prob": 0.0}, "Check")
+
+        j = to_act[0]
+        i = self.opps.index(j)
+        model = self.models.get(j)
+        decision, cell = self._cell(j, False, 0)
+        if decision == "preflop":
+            q = sum(showdown) / self.N
+            return ActionEV(ActionType.CHECK, 0, q, {"equity": round(self.equity, 4)}, "Check")
+        pol = self.e.lm.policy(self.strengths, self.weights[i], "unopened", model, cell)
+        frac = (model.bet_sizes.most_common_size() if model and model.bet_sizes.total_samples >= 5
+                else None) or self.cfg.villain_bet_size
+        b = min(int(frac * self.pot) or self.bb, self.gs.stacks[j], self.stack)
+        pbet = [pol.probs(self.strengths.get(t.opp_hands[i], 0.5))["bet"] for t in self.trials]
+        mass = sum(pbet)
+        # hero's best reply to the bet, over the combos that bet
+        ev_call = (sum(p * (self.U(self.stack - b + s * (self.pot + 2 * b)) - self.u0)
+                       for p, s in zip(pbet, self.share_all)) / mass) if mass > 0 else 0.0
+        reply = max(ev_call, 0.0)
+        q = (sum((1 - p) * v for p, v in zip(pbet, showdown)) + mass * reply) / self.N
+        return ActionEV(ActionType.CHECK, 0, q, {
+            "equity": round(self.equity, 4), "pot": self.pot,
+            "villain_bet_prob": round(mass / self.N, 3), "villain_bet": b,
+            "hero_reply_to_bet": "call" if ev_call > 0 else "fold",
+        }, "Check")
+
+    def _seats_after_hero(self) -> list[int]:
+        n = self.gs.num_players
+        return [(self.hero + k) % n for k in range(1, n)]
+
+    def q_bet(self, action_type: ActionType, total: int) -> ActionEV:
+        """Bet or raise to `total` (street commitment)."""
+        gs = self.gs
+        add = max(0, min(total - self.committed, self.stack))
+        total = self.committed + add
+        pot_after_call = self.pot + self.to_call
+        size_frac = (total - self.bet_before) / pot_after_call if pot_after_call > 0 else 1.0
+        if action_type == ActionType.ALL_IN or add == self.stack:
+            label_kind = "ALL_IN" if action_type == ActionType.ALL_IN else ActionType(action_type).name
+        else:
+            label_kind = ActionType(action_type).name
+        raises_before = gs.raises_this_street + 1
+
+        m = len(self.opps)
+        calls = [0] * m
+        cont: list[Optional[list[tuple[float, float]]]] = [None] * m
+        for i, s in enumerate(self.opps):
+            to_call_i = max(0, total - gs.current_bets[s])
+            calls[i] = min(to_call_i, gs.stacks[s])
+            if not self._can_act(s) or to_call_i == 0:
+                continue      # all-in players contest without responding
+            model = self.models.get(s)
+            decision, cell = self._cell(s, True, raises_before)
+            # Same definition the spectator records: faced bet / pot before it.
+            denom = self.pot + add - to_call_i
+            faced = to_call_i / denom if denom > 0 else 1.0
+            prof = self._profile(s)
+            fold_override = prof.fold_probability(size_frac, self.pot, total - self.bet_before) \
+                if prof is not None and hasattr(prof, "fold_probability") else None
+            pol = self.e.lm.policy(self.strengths, self.weights[i], decision, model,
+                                   cell, faced, fold_override)
+            cache: dict = {}
+            probs = []
+            for t in self.trials:
+                h = t.opp_hands[i]
+                v = cache.get(h)
+                if v is None:
+                    pd = pol.probs(self.strengths.get(h, 0.5))
+                    v = (pd["call"], pd["raise"])
+                    cache[h] = v
+                probs.append(v)
+            cont[i] = probs
+
+        win_now = self.U(self.stack + self.pot) - self.u0
+        responders = [i for i in range(m) if cont[i] is not None]
+        fold_prob_all = 0.0
+        eq_called_num = eq_called_den = 0.0
+        q_sum = 0.0
+
+        if len(responders) == 1 and m == 1:
+            # Heads-up: exact expectation over the villain's response.
+            i = responders[0]
+            j = self.opps[i]
+            pot_called = self.pot + add + calls[i]
+            called_vals, raise_w = [], []
+            for t_idx, t in enumerate(self.trials):
+                pc, pr = cont[i][t_idx]
+                s = self.share_all[t_idx]
+                pf = max(0.0, 1.0 - pc - pr)
+                fold_prob_all += pf
+                v_call = self.U(self.stack - add + s * pot_called) - self.u0
+                q_sum += pf * win_now + pc * v_call
+                eq_called_num += (pc + pr) * s
+                eq_called_den += pc + pr
+                raise_w.append(pr)
+                called_vals.append(s)
+            # villain raises: hero best-responds (fold or call the raise)
+            rmass = sum(raise_w)
+            if rmass > 0:
+                vil_left = gs.stacks[j] - calls[i]
+                raise_amt = min(int(self.cfg.villain_raise_size * pot_called),
+                                vil_left, self.stack - add)
+                pot_r = pot_called + 2 * raise_amt
+                ev_call_r = sum(w * (self.U(self.stack - add - raise_amt + s * pot_r) - self.u0)
+                                for w, s in zip(raise_w, called_vals)) / rmass
+                ev_fold_r = self.U(self.stack - add) - self.u0
+                q_sum += rmass * max(ev_call_r, ev_fold_r)
+            q = q_sum / self.N
+            fold_prob_all /= self.N
+        elif responders:
+            # Multi-way: independent responses sampled with common randoms.
+            for t_idx, t in enumerate(self.trials):
+                contenders, extra = [], 0
+                for i in range(m):
+                    if cont[i] is None:
+                        contenders.append(i)       # all-in: contests anyway
+                        continue
+                    pc, pr = cont[i][t_idx]
+                    if self.u[t_idx][i] < pc + pr:
+                        contenders.append(i)
+                        extra += calls[i]
+                if not contenders:
+                    q_sum += win_now
+                    fold_prob_all += 1
+                else:
+                    s = t.hero_share(contenders)
+                    q_sum += self.U(self.stack - add + s * (self.pot + add + extra)) - self.u0
+                    eq_called_num += s
+                    eq_called_den += 1
+            q = q_sum / self.N
+            fold_prob_all /= self.N
+        else:
+            # Nobody can respond (all opponents all-in): pure showdown.
+            extra = sum(calls)
+            q = sum(self.U(self.stack - add + s * (self.pot + add + extra))
+                    for s in self.share_all) / self.N - self.u0
+            eq_called_num, eq_called_den = sum(self.share_all), self.N
+
+        e_called = eq_called_num / eq_called_den if eq_called_den > 0 else self.equity
+        if e_called < self.cfg.bluff_equity_ceiling:
+            kind = "Bluff"
+        elif e_called > self.cfg.value_equity_floor:
+            kind = "Value"
+        else:
+            kind = "Thin-value"
+        pct = int(round(size_frac * 100))
+        return ActionEV(action_type, total, q, {
+            "equity": round(self.equity, 4), "pot": self.pot, "cost": add,
+            "bet_fraction_of_pot": round(size_frac, 2),
+            "fold_probability": round(fold_prob_all, 3),
+            "equity_when_called": round(e_called, 4),
+            "bet_type": kind,
+        }, f"{label_kind} {total} ({pct}% pot, {kind})")

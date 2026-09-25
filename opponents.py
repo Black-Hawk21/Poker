@@ -9,7 +9,8 @@ A library of opponent bots for testing and training:
     Maniac          High aggression and bluff frequency
     GTOLike         Fixed approximate GTO policy
     RigidBot        Deterministic thresholds and bet sizes
-    HeroBot         Wraps the Phase 2 strategy controller
+    AdaptiveBot     Changes strategy over time (switches persona)
+    HeroBot         The adaptive bot (all phases)
 
 Each bot implements the BaseBot interface.
 """
@@ -332,16 +333,57 @@ class RigidBot(BaseBot):
 
 
 # ===================================================================
-# HeroBot — wraps Phase 2 strategy controller + Phase 4 spectator learning
+# AdaptiveBot — changes strategy over time (design doc §28, Table)
+# ===================================================================
+class AdaptiveBot(BaseBot):
+    """
+    Switches persona every `switch_every` hands (e.g. nit → maniac →
+    calling station).  The test opponent for drift / changepoint detection
+    (§18): a model that never forgets would keep exploiting the old
+    persona.
+    """
+
+    def __init__(self, name: str = "Adaptive", seed: Optional[int] = None,
+                 switch_every: int = 60,
+                 personas: Optional[list[str]] = None):
+        super().__init__(name)
+        self.switch_every = switch_every
+        names = personas or ["nit", "maniac", "calling_station"]
+        self._personas = [ALL_OPPONENTS[p](seed=(seed or 0) + i) for i, p in enumerate(names)]
+        self._persona_names = names
+        self._hands = 0
+
+    @property
+    def current_persona(self) -> str:
+        return self._persona_names[(self._hands // self.switch_every) % len(self._personas)]
+
+    def _active(self) -> BaseBot:
+        return self._personas[(self._hands // self.switch_every) % len(self._personas)]
+
+    def observe_hand_start(self, info):
+        super().observe_hand_start(info)
+        for p in self._personas:
+            p.observe_hand_start(info)
+
+    def observe_hand_end(self, info):
+        self._hands += 1
+
+    def act(self, gs: GameState) -> Action:
+        return self._active().act(gs)
+
+
+# ===================================================================
+# HeroBot — the adaptive bot (all phases)
 # ===================================================================
 class HeroBot(BaseBot):
     """
-    The adaptive bot: Phase 1-2 engine + Phase 3 range inference +
-    Phase 4 spectator learning.
+    Poker engine + Bayesian range inference with the §12 likelihood model +
+    spectator learning + MDF-loop exploitation + regret-matched randomization.
 
-    During each hand, maintains a live Bayesian range for every opponent
-    that narrows as actions are observed. The inferred range feeds into
-    the Monte Carlo equity estimator for more accurate EV calculations.
+    Per hand: a RangeTracker narrows each opponent's range from their
+    actions (with pre-action context); the ranges feed the decision engine,
+    together with each opponent's model (response probabilities) and
+    ExploitProfile (confidence-scaled fold rates by size).
     """
 
     def __init__(self, name: str = "Hero",
@@ -349,78 +391,107 @@ class HeroBot(BaseBot):
                  ev_config: Optional[EVConfig] = None,
                  strategy_config: Optional[StrategyConfig] = None,
                  seed: Optional[int] = None,
-                 learning: bool = True):
+                 learning: bool = True,
+                 adapt_mode: bool = True):
         super().__init__(name)
         self._controller = StrategyController(
-            ev_config=ev_config or EVConfig(equity_simulations=500,
-                                            equity_simulations_important=1000),
+            ev_config=ev_config or EVConfig(equity_simulations=400,
+                                            equity_simulations_important=800),
             strategy_config=strategy_config,
             rng_seed=seed,
         )
         self._controller.mode = mode
         self._base_mode = mode
+        self._seed = seed
+        self.adapt_mode = adapt_mode
 
-        # Phase 4: spectator learning
+        from spectator import SpectatorLearner
+        from exploiter import Exploiter
+        from calibration import CalibrationTracker
         self.learning = learning
-        self._learner = None
-        if learning:
-            from spectator import SpectatorLearner
-            self._learner = SpectatorLearner()
+        self._learner = SpectatorLearner() if learning else None
+        self._exploiter = Exploiter()
+        self.calibration = CalibrationTracker()
 
-        # Phase 3: live range tracking (per-hand)
         self._range_tracker = None
+        self._profiles: dict = {}
+        self._positions: list[str] = []
         self._current_board: list[int] = []
         self._num_players: int = 2
+        self._hole: list[int] = []
+        self._street_aggressor: dict[int, int] = {}
+        self._decisions = 0
 
+    # ------------------------------------------------------------------
+    # Observation hooks
+    # ------------------------------------------------------------------
     def observe_hand_start(self, info):
         super().observe_hand_start(info)
         self._num_players = info.num_players
+        self._positions = list(info.positions)
         self._current_board = []
-
+        self._hole = list(info.hole_cards)
+        self._street_aggressor = {}
         if self._learner:
             self._learner.on_hand_start(info)
 
-        # Phase 3: init range tracker for this hand
         from range_inference import RangeTracker
-        self._range_tracker = RangeTracker(
-            hero_seat=info.seat,
-            hero_cards=list(info.hole_cards),
-        )
-        # Build initial ranges using learned models (Phase 4 → Phase 3)
-        opp_models = {}
+        self._range_tracker = RangeTracker(hero_seat=info.seat,
+                                           hero_cards=list(info.hole_cards))
+        models = {}
+        self._profiles = {}
         if self._learner:
             for seat in range(info.num_players):
                 if seat != info.seat:
-                    opp_models[seat] = self._learner.get_model(seat)
-        self._range_tracker.init_preflop(info.num_players, opp_models)
+                    models[seat] = self._learner.get_model(seat)
+                    self._profiles[seat] = self._exploiter.build_profile(models[seat])
+        sitting_out = [s for s in range(info.num_players)
+                       if info.stacks and info.stacks[s] <= 0]
+        self._range_tracker.init_preflop(info.num_players, models,
+                                         positions=self._positions,
+                                         sitting_out=sitting_out)
 
     def observe_action(self, action, game_state):
         if self._learner:
             self._learner.on_action(action, game_state)
-
-        # Phase 3: update opponent range based on their action
+        if action.is_aggressive:
+            self._street_aggressor[int(action.street)] = action.player
         if self._range_tracker and action.player != self.seat:
-            facing_bet = (game_state.max_current_bet >
-                          game_state.current_bets[action.player])
-            self._range_tracker.update_action(
-                action_seat=action.player,
-                action_type=action.action_type,
-                street=action.street,
-                board=self._current_board,
-                pot=game_state.pot,
-                bet_amount=action.amount,
-                facing_bet=facing_bet,
-            )
+            if action.action_type == ActionType.FOLD:
+                self._range_tracker.mark_folded(action.player)
+            else:
+                self._range_tracker.update_action(
+                    action_seat=action.player,
+                    action_type=action.action_type,
+                    street=action.street,
+                    board=self._current_board,
+                    action=action,
+                )
 
     def observe_board(self, street, board):
         self._current_board = list(board)
         if self._learner:
             self._learner.on_board(street, board)
-        # Phase 3: remove board cards from ranges
         if self._range_tracker:
             self._range_tracker.update_board(board)
 
     def observe_showdown(self, info):
+        # §28 calibration: did the range posterior predict who was ahead?
+        if self._range_tracker and len(info.board) == 5 and self.seat in info.revealed_cards:
+            from hand_evaluator import evaluate
+            mine = evaluate(self._hole + list(info.board))
+            for seat, cards in info.revealed_cards.items():
+                if seat == self.seat:
+                    continue
+                lr = self._range_tracker.get_range(seat)
+                if lr is None or not lr.size:
+                    continue
+                w = lr.normalized()
+                p_ahead = sum(p for h, p in w.items()
+                              if not (set(h) & set(info.board))
+                              and evaluate([h[0], h[1]] + list(info.board)) > mine)
+                actual = evaluate(list(cards) + list(info.board)) > mine
+                self.calibration.record(p_ahead, actual)
         if self._learner:
             self._learner.on_showdown(info)
 
@@ -428,72 +499,50 @@ class HeroBot(BaseBot):
         if self._learner:
             self._learner.on_hand_end(info)
             self._adapt_strategy()
-        self._range_tracker = None  # reset for next hand
+        self._range_tracker = None
 
     def _adapt_strategy(self):
-        """Switch strategy mode based on learned opponent types."""
-        if not self._learner or self._base_mode != StrategyMode.BALANCED:
+        """Mode label from the exploiter's hysteretic classification (§21)."""
+        if not self._learner or not self.adapt_mode or self._base_mode != StrategyMode.BALANCED:
             return
+        from strategy import MODE_FROM_LABEL
+        opps = [s for s in range(self._num_players) if s != self.seat]
+        labels = [self._exploiter.build_profile(self._learner.get_model(s)).strategy_mode
+                  for s in opps]
+        if labels and all(l == labels[0] for l in labels):
+            self._controller.mode = MODE_FROM_LABEL.get(labels[0], StrategyMode.BALANCED)
+        else:
+            self._controller.mode = StrategyMode.BALANCED
 
-        models = self._learner.models.all_models()
-        opponents = {k: v for k, v in models.items() if k != self.seat}
-        if len(opponents) == 1:
-            opp_model = list(opponents.values())[0]
-            if opp_model.hands_observed >= 15:
-                suggestion = self._learner.suggest_strategy(opp_model.player_id)
-                mode_map = {
-                    "value_heavy": StrategyMode.VALUE_HEAVY,
-                    "aggressive": StrategyMode.AGGRESSIVE,
-                    "trap_heavy": StrategyMode.TRAP_HEAVY,
-                    "balanced": StrategyMode.BALANCED,
-                }
-                self._controller.mode = mode_map.get(suggestion,
-                                                     StrategyMode.BALANCED)
+    # ------------------------------------------------------------------
+    # Decision
+    # ------------------------------------------------------------------
+    def decision_inputs(self, gs: GameState) -> dict:
+        """Everything the engine needs beyond the game state."""
+        live = [s for s in gs.active_players if s != self.seat]
+        ranges = (self._range_tracker.get_ranges_for_equity(live)
+                  if self._range_tracker else None)
+        models = ({s: self._learner.get_model(s) for s in live}
+                  if self._learner else {})
+        prev = self._street_aggressor.get(int(gs.street) - 1) if gs.street > 0 else None
+        return dict(opponent_ranges=ranges, models=models,
+                    exploit_profiles={s: self._profiles[s] for s in live if s in self._profiles},
+                    positions=self._positions, prev_aggressor=prev)
 
     def act(self, gs: GameState) -> Action:
-        # Phase 3: feed inferred ranges to the decision engine
-        opp_ranges = None
-        if self._range_tracker:
-            opp_ranges = self._range_tracker.get_ranges_for_equity()
-
-        # Phase 5: build exploit profile for the primary opponent
-        exploit_profile = None
-        if self._learner and self.learning:
-            exploit_profile = self._build_exploit_profile(gs)
-
-        decision = self._controller.decide(
-            gs, hero=self.seat,
-            opponent_ranges=opp_ranges,
-            exploit_profile=exploit_profile,
-        )
+        self._decisions += 1
+        kw = self.decision_inputs(gs)
+        seed = None if self._seed is None else self._seed * 100003 + self._decisions
+        decision = self._controller.decide(gs, hero=self.seat, rng_seed=seed, **kw)
         return StrategyController.to_action(decision, self.seat, gs.street)
-
-    def _build_exploit_profile(self, gs: GameState):
-        """Build an exploit profile for the current primary opponent."""
-        from exploiter import Exploiter
-
-        # Find the primary opponent (in HU it's the only one; multi-way
-        # use the most aggressive active opponent)
-        active_opps = [s for s in gs.active_players if s != self.seat]
-        if not active_opps:
-            return None
-
-        target = active_opps[0]
-        if len(active_opps) > 1:
-            # Pick the opponent who has bet/raised most recently
-            for a in reversed(gs.action_history):
-                if (a.player in active_opps and
-                        a.action_type in (ActionType.BET, ActionType.RAISE)):
-                    target = a.player
-                    break
-
-        model = self._learner.get_model(target)
-        exploiter = Exploiter()
-        return exploiter.build_profile(model)
 
     @property
     def learner(self):
         return self._learner
+
+    @property
+    def exploiter(self):
+        return self._exploiter
 
     @property
     def range_tracker(self):
@@ -511,6 +560,8 @@ ALL_OPPONENTS = {
     "gto_like": GTOLikeBot,
     "rigid": RigidBot,
 }
+
+ALL_OPPONENTS["adaptive"] = AdaptiveBot   # wraps the entries above
 
 def make_opponent(name: str, seed: Optional[int] = None) -> BaseBot:
     """Factory: create an opponent bot by name."""

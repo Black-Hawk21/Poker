@@ -121,11 +121,27 @@ class StatsTracker:
         pot: int,
         vpip_seats: set[int],         # seats that voluntarily entered
         pfr_seats: set[int],          # seats that raised preflop
+        showdown_seats: Optional[set[int]] = None,  # seats that reached showdown
+        dealt_seats: Optional[set[int]] = None,     # seats dealt in (not busted)
     ):
-        """Record one completed hand's results."""
+        """Record one completed hand's results.
+
+        showdown_seats should list every player still in at showdown.  (The
+        old code guessed with "net < 0 and not a winner ⇒ folded", which
+        classified every showdown *loser* as having folded, so showdown
+        win rates were ~100%.)  If omitted, it is approximated (exact heads-up).
+        """
         self.total_hands += 1
+        if showdown_seats is None:
+            # Legacy callers: approximate as "everyone who won or lost chips"
+            # (exact heads-up; the runner always passes showdown_seats).
+            showdown_seats = ({s for s in range(len(player_names))
+                               if s in winners or net_won.get(s, 0) != 0}
+                              if went_to_showdown else set())
 
         for seat, name in enumerate(player_names):
+            if dealt_seats is not None and seat not in dealt_seats:
+                continue
             ps = self._get(name)
             ps.hands_played += 1
             net = net_won.get(seat, 0)
@@ -141,12 +157,12 @@ class StatsTracker:
                 ps.total_lost += abs(net)
                 ps.pots_lost_total += pot
 
-            if went_to_showdown and not self._was_folded(seat, net, winners):
+            if seat in showdown_seats:
                 ps.showdowns += 1
                 if seat in winners:
                     ps.showdown_wins += 1
 
-            if not went_to_showdown and seat in winners:
+            if seat in winners and seat not in showdown_seats:
                 ps.non_showdown_wins += 1
                 ps.non_showdown_chips += net
 
@@ -166,11 +182,6 @@ class StatsTracker:
         for seat, name in enumerate(player_names):
             running = (self._net_history[name][-1] if self._net_history[name] else 0)
             self._net_history[name].append(running + net_won.get(seat, 0))
-
-    @staticmethod
-    def _was_folded(seat, net, winners):
-        """Heuristic: if net < 0 and not a winner, probably folded or lost."""
-        return net < 0 and seat not in winners
 
     # ------------------------------------------------------------------
     # Reports

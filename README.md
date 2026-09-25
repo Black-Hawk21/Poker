@@ -8,18 +8,36 @@ making, and optional RNG inference — all in pure Python with no dependencies.
 
 ```bash
 # Run the demo (tournament + OracleBot showcase)
-cd poker_bot
 python demo.py
 
-# Run all tests (166 tests across 4 suites)
+# Run all tests (267 tests across 7 suites)
 python run_tests.py
 
 # Run a single test suite
-python test_phase1.py
-python test_phase2.py
-python test_environment.py
-python test_phase6.py
+python test_phase1.py   # ... through test_phase6.py, plus test_environment.py
 ```
+
+## What's new in this revision
+
+This build matches the **Revised Edition** of the design document. It corrects
+the probability/game-theory content and rebuilds the modeling and exploitation
+layers. Highlights (see `CHANGELOG.md` for the full list, keyed to doc sections):
+
+- Correct multi-way equity (1/k ties), card-removal-aware joint dealing, and the
+  full weighted range passed to the equity engine.
+- An explicit, per-opponent **action-likelihood model** (§12) driving Bayesian
+  range inference, with credible-interval-scaled confidence and empirical-Bayes
+  shrinkage (§16–§19).
+- A response-model **decision engine** — `Q(s,a)=Σ_r P(r|a)·E[U]` — that handles
+  fold equity without double counting and uses a proper utility (chip / concave
+  / **ICM**) instead of a risk penalty (§20).
+- The **MDF exploitation loop** (§6, §22): measured fold-to-bet by size vs
+  `1−MDF(B)`, deviations scaled by confidence with hysteresis, residuals
+  randomized by **regret matching** (§7).
+- RNG analysis reframed as **state recovery + call-count offset search**, with
+  the predicted board used only as a confidence-weighted feature (§23–§24).
+- Bots receive a **per-seat view** (no peeking at hole cards), plus working
+  **tournament stacks and side pots**, and corrected **showdown stats**.
 
 ## Architecture
 
@@ -101,7 +119,7 @@ GAME ENVIRONMENT (game_runner.py)
 | `run_tests.py` | 48 | Runs all 5 suites, prints combined summary |
 | `demo.py` | 170 | Round-robin tournament + OracleBot showcase + ablation |
 
-**Total: ~6,000 lines, 202 tests, 0 external dependencies.**
+**Total: ~7,800 lines, 267 tests, 0 external dependencies.**
 
 ## Synthetic Opponents
 
@@ -113,6 +131,7 @@ GAME ENVIRONMENT (game_runner.py)
 | ManiacBot | ~80% | Bets/raises 70% with any hand | Trap with strong hands, call down |
 | GTOLikeBot | ~65% | Fixed ranges, 2/3-pot c-bet, balanced | Detect rigid frequencies |
 | RigidBot | ~45% | Pure if/else thresholds, no randomization | Identify thresholds exactly |
+| AdaptiveBot | varies | Switches persona every N hands | Drift / changepoint detection (§18) |
 
 ## Key Design Decisions
 

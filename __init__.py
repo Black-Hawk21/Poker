@@ -4,15 +4,20 @@ Adaptive Adversarial Poker Bot
 A modular poker bot framework implementing:
 
   Phase 1 — Correct Poker Engine
-    hand_evaluator    Card encoding, 5-7 card hand evaluation
+    hand_evaluator    Card encoding, fast + reference 5-7 card evaluation
+    hand_strength     Percentile hand-strength tables (preflop + per board)
     deck              Shuffleable 52-card deck
     game_state        Full Hold'em state machine (blinds, streets, legal actions)
     equity            Monte Carlo equity estimator + pot odds helpers
 
   Phase 2 — EV Decision Engine
     board_texture     Community board feature vector (wetness, draws, pairing)
-    decision_engine   Q(s,a) estimation with fold equity, sizing, SPR awareness
-    strategy          Softmax randomized policy + strategy modes
+    action_likelihood Explicit P(A|h,s,M) model (§12)
+    utility           Chip / concave / ICM utilities (§8, §20)
+    decision_engine   Q(s,a)=Σ_r P(r|a)·E[U] response-model engine (§20)
+    strategy          Near-optimal randomization + regret matching (§7)
+    exploiter         MDF-loop exploitation, confidence-scaled (§6, §22)
+    calibration       Reliability curve / ECE for predictions (§28)
 
   Phase 4 — Spectator Learning & Opponent Modeling
     opponent_model    Per-opponent Bayesian stats, fingerprinting, type classification
@@ -37,4 +42,4 @@ Quick start:
     print(stats.report())
 """
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"

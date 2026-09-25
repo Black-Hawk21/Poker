@@ -42,20 +42,16 @@ print("\n═══ EXPLOIT PROFILE — CALLING STATION ═══")
 
 print("\n  Building profile for a calling station:")
 cs_model = OpponentModel(player_id=1)
-# High VPIP, low aggression, low fold rate
-for _ in range(40):
-    cs_model.vpip.update(True)
-for _ in range(5):
-    cs_model.vpip.update(False)
-for _ in range(35):
-    cs_model.postflop_aggression.update(False)  # passive
-for _ in range(5):
-    cs_model.postflop_aggression.update(True)
-for _ in range(5):
-    cs_model.fold_to_bet.update(True)
-for _ in range(35):
-    cs_model.fold_to_bet.update(False)  # rarely folds
+# High VPIP, low aggression, calls almost every bet at every size.
 for _ in range(45):
+    cs_model.record_preflop_hand("BB", vpip=(_ % 9 != 0), pfr=False,
+                                 faced_raise=True, three_bet=False)
+    for size in (0.33, 0.66, 1.0, 1.5):
+        folds = (_ % 12 == 0)   # ~8% fold
+        cs_model.record_postflop_action(
+            ActionType.FOLD if folds else ActionType.CALL, Street.FLOP,
+            0, 100, is_aggressor=False, facing_bet=True, facing_raise=False,
+            size_fraction=size)
     cs_model.finish_hand()
 
 exploiter = Exploiter()
@@ -63,20 +59,20 @@ cs_profile = exploiter.build_profile(cs_model)
 
 check("Classified as passive", cs_profile.opponent_type == "passive",
       f"type={cs_profile.opponent_type}")
-check("Low bluff ceiling (don't bluff)",
-      cs_profile.bluff_equity_ceiling < POPULATION_DEFAULTS.bluff_equity_ceiling,
-      f"bluff_ceil={cs_profile.bluff_equity_ceiling:.2f}")
-check("Low bluff cap",
-      cs_profile.bluff_frequency_cap < 0.20,
-      f"bluff_cap={cs_profile.bluff_frequency_cap:.2f}")
-check("Lower value floor (value bet wider)",
-      cs_profile.value_equity_floor < POPULATION_DEFAULTS.value_equity_floor,
-      f"val_floor={cs_profile.value_equity_floor:.2f}")
 check("Strategy = value_heavy",
       cs_profile.strategy_mode == "value_heavy",
       f"mode={cs_profile.strategy_mode}")
+# §22: an over-caller's fold rate is below the balanced reference in every
+# size bucket, and hero's recommended bluff share collapses toward zero.
+station_devs = [d for d in cs_profile.deviations if d.verdict != "near-balanced"]
+check("Over-caller detected via MDF (q̂ < 1−MDF)",
+      any(d.verdict == "over-calls" for d in cs_profile.deviations),
+      f"verdicts={[d.verdict for d in cs_profile.deviations]}")
+check("Low recommended bluff share vs station",
+      cs_profile.hero_bluff_share_pot < 0.20,
+      f"hero_phi={cs_profile.hero_bluff_share_pot:.2f}")
 check("Low fold-to-bet (from actual data)",
-      cs_profile.fold_to_bet < 0.25,
+      cs_profile.fold_to_bet < 0.30,
       f"fold_bet={cs_profile.fold_to_bet:.2f}")
 
 print(f"    {exploiter.summary(cs_profile)}")
@@ -88,37 +84,37 @@ print("\n═══ EXPLOIT PROFILE — NIT ═══")
 
 print("\n  Building profile for a nit:")
 nit_model = OpponentModel(player_id=2)
-for _ in range(35):
-    nit_model.vpip.update(False)
-for _ in range(5):
-    nit_model.vpip.update(True)
-for _ in range(25):
-    nit_model.fold_to_bet.update(True)  # folds a lot
-for _ in range(10):
-    nit_model.fold_to_bet.update(False)
-for _ in range(15):
-    nit_model.postflop_aggression.update(False)
-for _ in range(5):
-    nit_model.postflop_aggression.update(True)
 for _ in range(40):
+    nit_model.record_preflop_hand("UTG", vpip=(_ % 8 == 0), pfr=(_ % 8 == 0),
+                                  faced_raise=True, three_bet=False)
+    for size in (0.33, 0.66, 1.0, 1.5):
+        folds = (_ % 4 != 0)    # ~75% fold, more at bigger sizes
+        if size >= 1.0:
+            folds = (_ % 10 != 0)
+        nit_model.record_postflop_action(
+            ActionType.FOLD if folds else ActionType.CALL, Street.FLOP,
+            0, 100, is_aggressor=False, facing_bet=True, facing_raise=False,
+            size_fraction=size)
     nit_model.finish_hand()
 
 nit_profile = exploiter.build_profile(nit_model)
 
 check("Classified as tight", nit_profile.opponent_type == "tight",
       f"type={nit_profile.opponent_type}")
-check("High bluff ceiling (bluff more vs nit)",
-      nit_profile.bluff_equity_ceiling > POPULATION_DEFAULTS.bluff_equity_ceiling,
-      f"bluff_ceil={nit_profile.bluff_equity_ceiling:.2f}")
 check("Strategy = aggressive",
       nit_profile.strategy_mode == "aggressive",
       f"mode={nit_profile.strategy_mode}")
 check("High fold-to-bet (from data)",
       nit_profile.fold_to_bet > 0.55,
       f"fold_bet={nit_profile.fold_to_bet:.2f}")
-check("Positive call-threshold adjust (fold when they bet back)",
-      nit_profile.call_threshold_adjust > 0,
-      f"call_adj={nit_profile.call_threshold_adjust:.2f}")
+# §22: an over-folder is detected against the balanced reference, and the
+# recommended bluff share rises toward (but never past) ϕ's ceiling of 1/2.
+check("Over-folder detected via MDF (q̂ > 1−MDF)",
+      any(d.verdict == "over-folds" for d in nit_profile.deviations),
+      f"verdicts={[d.verdict for d in nit_profile.deviations]}")
+check("Higher recommended bluff share vs nit than vs station",
+      nit_profile.hero_bluff_share_pot > cs_profile.hero_bluff_share_pot,
+      f"nit={nit_profile.hero_bluff_share_pot:.2f} cs={cs_profile.hero_bluff_share_pot:.2f}")
 
 print(f"    {exploiter.summary(nit_profile)}")
 
@@ -130,20 +126,18 @@ print("\n═══ EXPLOIT PROFILE — MANIAC ═══")
 print("\n  Building profile for a maniac:")
 man_model = OpponentModel(player_id=3)
 for _ in range(40):
-    man_model.vpip.update(True)
-for _ in range(35):
-    man_model.postflop_aggression.update(True)
-for _ in range(5):
-    man_model.postflop_aggression.update(False)
-for _ in range(10):
-    man_model.fold_to_bet.update(True)
-for _ in range(30):
-    man_model.fold_to_bet.update(False)
-for _ in range(15):
-    man_model.bluff_frequency.update(True)
-for _ in range(10):
-    man_model.bluff_frequency.update(False)
-for _ in range(40):
+    man_model.record_preflop_hand("BTN", vpip=True, pfr=(_ % 5 != 0),
+                                  faced_raise=False, three_bet=False)
+    man_model.record_postflop_action(ActionType.BET, Street.FLOP, 80, 100,
+                                     is_aggressor=True, facing_bet=False,
+                                     facing_raise=False, size_fraction=0.8)
+    folds = (_ % 4 == 0)        # ~25% fold to a bet
+    man_model.record_postflop_action(
+        ActionType.FOLD if folds else ActionType.CALL, Street.FLOP,
+        0, 100, is_aggressor=False, facing_bet=True, facing_raise=False,
+        size_fraction=0.66)
+    if _ % 3 == 0:
+        man_model.record_showdown(won=False, was_bluffing=True)
     man_model.finish_hand()
 
 man_profile = exploiter.build_profile(man_model)
@@ -153,12 +147,12 @@ check("Classified as aggressive", man_profile.opponent_type == "aggressive",
 check("Strategy = trap_heavy",
       man_profile.strategy_mode == "trap_heavy",
       f"mode={man_profile.strategy_mode}")
-check("Positive hero-call boost (call down vs bluffer)",
-      man_profile.hero_call_boost > 0,
-      f"call_boost={man_profile.hero_call_boost:.2f}")
-check("Low bluff cap (don't bluff — they'll raise)",
-      man_profile.bluff_frequency_cap < 0.25,
-      f"bluff_cap={man_profile.bluff_frequency_cap:.2f}")
+check("Recommended bluff share bounded by phi ceiling (< 0.5)",
+      man_profile.bluff_frequency_cap <= 0.5,
+      f"cap={man_profile.bluff_frequency_cap:.2f}")
+check("Bluff share not inflated vs a non-folder",
+      man_profile.hero_bluff_share_pot < 0.5,
+      f"hero_phi={man_profile.hero_bluff_share_pot:.2f}")
 
 print(f"    {exploiter.summary(man_profile)}")
 
@@ -174,10 +168,16 @@ for _ in range(5):
     low_model.finish_hand()
 
 low_profile = exploiter.build_profile(low_model)
-check("Low confidence (< min threshold)",
-      low_profile.confidence == 0.0,
-      f"conf={low_profile.confidence}")
+check("Low confidence with little data",
+      low_profile.confidence < 0.3,
+      f"conf={low_profile.confidence:.2f}")
 check("Type = unknown", low_profile.opponent_type == "unknown")
+# With no data, the fold rate used is the balanced reference (q_used=q_ref),
+# at which a pure bluff exactly breaks even — no phantom exploitation.
+from equity import balanced_bluff_fraction
+check("Unknown opponent → fold rate = balanced reference",
+      abs(low_profile.fold_probability(1.0) - 0.5) < 0.05,
+      f"fold_pot={low_profile.fold_probability(1.0):.2f}")
 
 print("\n  Medium-data opponent (25 hands) → partial blend:")
 med_model = OpponentModel(player_id=11)
@@ -193,11 +193,12 @@ for _ in range(25):
 med_profile = exploiter.build_profile(med_model)
 check("Medium confidence (0 < c < 1)",
       0 < med_profile.confidence < 1,
-      f"conf={med_profile.confidence}")
-# Fold-to-bet should be between raw (0.20) and default (0.40)
-check("Fold-to-bet blended between raw and default",
-      0.15 < med_profile.fold_to_bet < 0.45,
-      f"fold_bet={med_profile.fold_to_bet:.2f}")
+      f"conf={med_profile.confidence:.2f}")
+# Confidence-scaled fold rate sits between the balanced reference and the
+# opponent's raw over-calling rate.
+check("Fold rate blended toward balanced reference",
+      0.10 < med_profile.fold_probability(0.66) < 0.45,
+      f"fold={med_profile.fold_probability(0.66):.2f}")
 
 
 # ===================================================================
@@ -336,11 +337,9 @@ print(f"  {'─' * 62}")
 fields = [
     ("fold_to_bet", "Fold to bet"),
     ("fold_to_raise", "Fold to raise"),
-    ("bluff_equity_ceiling", "Bluff ceiling"),
     ("bluff_frequency_cap", "Bluff cap"),
-    ("value_equity_floor", "Value floor"),
-    ("call_threshold_adjust", "Call adjust"),
-    ("hero_call_boost", "Call boost"),
+    ("hero_bluff_share_pot", "Hero bluff phi"),
+    ("confidence", "Confidence"),
     ("temperature_scale", "Temp scale"),
 ]
 
@@ -348,7 +347,7 @@ for attr, label in fields:
     print(f"  {label:<20}", end="")
     for _, prof in profiles:
         val = getattr(prof, attr)
-        print(f" {val:>+10.2f}" if "adjust" in attr or "boost" in attr
+        print(f" {val:>+10.2f}" if "adjust" in attr or "boost" in attr or "phi" in attr
               else f" {val:>10.2f}", end="")
     print()
 

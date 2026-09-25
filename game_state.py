@@ -12,6 +12,7 @@ Handles:
 """
 
 from __future__ import annotations
+import copy
 from dataclasses import dataclass, field
 from enum import IntEnum, auto
 from typing import Optional
@@ -57,8 +58,44 @@ class Position(IntEnum):
 class Action:
     player: int
     action_type: ActionType
-    amount: int = 0       # total chips committed this action (0 for fold/check)
+    amount: int = 0       # BET/RAISE/ALL_IN: total street commitment after the
+                          # action.  CALL: chips added.  FOLD/CHECK: 0.
     street: Street = Street.PREFLOP
+
+    # --- pre-action context, filled in by GameState.apply_action() ---
+    # Observers receive the action *after* it has been applied, so anything
+    # that needs "what was the player facing?" (range updates, fold-to-bet,
+    # 3-bet detection, bet-size ratios) must read these fields rather than
+    # the post-action GameState.
+    to_call: int = 0          # chips needed to call before acting
+    pot_before: int = 0       # pot before this action
+    bet_before: int = 0       # highest street commitment before this action
+    committed_before: int = 0 # this player's street commitment before acting
+    raises_before: int = 0    # voluntary bets/raises this street before this action
+    stack_before: int = 0     # player's remaining stack before acting
+
+    @property
+    def facing_bet(self) -> bool:
+        return self.to_call > 0
+
+    @property
+    def is_aggressive(self) -> bool:
+        return self.action_type in (ActionType.BET, ActionType.RAISE, ActionType.ALL_IN) \
+            and self.amount > self.bet_before
+
+    @property
+    def size_fraction(self) -> float:
+        """Chips added beyond a call, as a fraction of the pot after calling.
+
+        For an opening bet this is simply bet / pot.  For a raise it is the
+        raise increment over the pot the raiser would face after calling —
+        the same convention the decision engine uses for hero's own sizes.
+        """
+        if not self.is_aggressive:
+            return 0.0
+        added = self.amount - self.bet_before
+        denom = self.pot_before + self.to_call
+        return added / denom if denom > 0 else 1.0
 
     def __repr__(self):
         name = ActionType(self.action_type).name
@@ -110,6 +147,13 @@ class GameState:
     hand_over: bool = False
     # Set of players who still need to act this street
     needs_to_act: set = field(default_factory=set)
+    # Players who acted since the last *full* bet/raise.  If an all-in raise
+    # is smaller than a full raise, these players may only call or fold
+    # (standard no-limit rule: an incomplete raise does not reopen betting).
+    acted_since_full_raise: set = field(default_factory=set)
+    cannot_reraise: set = field(default_factory=set)
+    # Voluntary bets/raises made on the current street.
+    raises_this_street: int = 0
 
     # ------------------------------------------------------------------
     # Initialisation helpers
@@ -130,48 +174,62 @@ class GameState:
         self.last_raiser = -1
         self.last_raise_size = self.big_blind
         self.num_actions_this_street = 0
+        self.raises_this_street = 0
+        self.acted_since_full_raise = set()
+        self.cannot_reraise = set()
 
         self.needs_to_act = set()
+
+        # Seats with no chips (busted in tournament play) sit the hand out.
+        for i in range(self.num_players):
+            if self.stacks[i] <= 0:
+                self.folded[i] = True
 
         self._assign_positions()
         self._post_blinds()
 
+    def _live_seats_from_dealer(self) -> list[int]:
+        """Seats dealt into the hand, starting at the button and going clockwise."""
+        n = self.num_players
+        seats = [(self.dealer_seat + i) % n for i in range(n)]
+        return [s for s in seats if not self.folded[s]]
+
     def _assign_positions(self):
         """Map seat indices to positional labels based on dealer."""
         n = self.num_players
-        self.positions = [Position.BTN] * n
-        if n == 2:
-            self.positions[self.dealer_seat] = Position.BTN  # BTN = SB in HU
-            self.positions[(self.dealer_seat + 1) % n] = Position.BB
+        self.positions = [Position.MP] * n
+        live = self._live_seats_from_dealer()
+        if len(live) == 2:
+            self.positions[live[0]] = Position.BTN  # BTN = SB in HU
+            self.positions[live[1]] = Position.BB
         else:
             order = [Position.BTN, Position.SB, Position.BB,
                      Position.UTG, Position.UTG1, Position.MP,
                      Position.MP1, Position.CO, Position.HJ]
-            for i in range(n):
-                seat = (self.dealer_seat + i) % n
+            for i, seat in enumerate(live):
                 self.positions[seat] = order[i] if i < len(order) else Position.MP
 
     def _post_blinds(self):
-        n = self.num_players
-        if n == 2:
-            sb_seat = self.dealer_seat
-            bb_seat = (self.dealer_seat + 1) % n
+        live = self._live_seats_from_dealer()
+        if len(live) < 2:
+            self.hand_over = True
+            return
+        if len(live) == 2:
+            sb_seat, bb_seat = live[0], live[1]
+            first = sb_seat               # BTN/SB acts first preflop in HU
         else:
-            sb_seat = (self.dealer_seat + 1) % n
-            bb_seat = (self.dealer_seat + 2) % n
+            sb_seat, bb_seat = live[1], live[2]
+            first = live[3 % len(live)]   # left of the big blind
 
         self._force_bet(sb_seat, min(self.small_blind, self.stacks[sb_seat]))
         self._force_bet(bb_seat, min(self.big_blind, self.stacks[bb_seat]))
-
-        # First to act preflop: left of BB (or SB in HU after posting)
-        if n == 2:
-            self.actor = self.dealer_seat  # BTN/SB acts first preflop in HU
-        else:
-            self.actor = (bb_seat + 1) % n
+        self.actor = first
 
         # Everyone who can act needs to act at least once preflop
         # BB gets an option even if no one raises (the "big blind option")
         self.needs_to_act = set(self.players_can_act)
+        if self.all_in[self.actor] or self.folded[self.actor]:
+            self._advance_actor()
 
     def _force_bet(self, seat: int, amount: int):
         self.stacks[seat] -= amount
@@ -200,17 +258,30 @@ class GameState:
 
     @property
     def effective_stack(self) -> int:
-        """Smallest stack among active players (useful for HU)."""
-        active_stacks = [self.stacks[i] + self.current_bets[i]
-                         for i in self.active_players]
-        return min(active_stacks) if active_stacks else 0
+        """Effective remaining stack for the current actor."""
+        return self.effective_stack_for(self.actor)
+
+    def effective_stack_for(self, seat: int) -> int:
+        """Chips `seat` can actually win or lose from here on.
+
+        min(own remaining stack, largest remaining stack among the other
+        players still in the hand).  A deep stack facing a short stack is
+        only as deep as the short stack.
+        """
+        others = [self.stacks[i] for i in self.active_players if i != seat]
+        if not others:
+            return self.stacks[seat]
+        return min(self.stacks[seat], max(others))
 
     @property
     def spr(self) -> float:
-        """Stack-to-pot ratio for the hero (actor)."""
+        """Stack-to-pot ratio (Eq. 19) for the actor: effective stack / pot."""
+        return self.spr_for(self.actor)
+
+    def spr_for(self, seat: int) -> float:
         if self.pot == 0:
             return float('inf')
-        return self.stacks[self.actor] / self.pot
+        return self.effective_stack_for(seat) / self.pot
 
     # ------------------------------------------------------------------
     # Legal actions
@@ -245,6 +316,11 @@ class GameState:
             min_bet = min(self.big_blind, stack)
             if stack > 0:
                 actions.append(LegalAction(ActionType.BET, min_bet, stack))
+        elif player in self.cannot_reraise or not any(
+                s != player and not self.all_in[s] for s in self.active_players):
+            # Facing an incomplete all-in raise after already acting, or
+            # everyone else is all-in: calling/folding only.
+            pass
         else:
             # Raise: min raise = last raise size on top of current bet to match
             min_raise_total = self.max_current_bet + max(self.last_raise_size, self.big_blind)
@@ -252,7 +328,11 @@ class GameState:
             if min_raise_cost > stack:
                 # Can only all-in for less than a min-raise
                 if stack > to_call:
-                    actions.append(LegalAction(ActionType.ALL_IN, stack, stack))
+                    # Amounts are street totals, like BET/RAISE.  (Previously
+                    # this was the bare stack, so a player who had already
+                    # put chips in this street was not actually all-in.)
+                    total = self.current_bets[player] + stack
+                    actions.append(LegalAction(ActionType.ALL_IN, total, total))
             else:
                 actions.append(LegalAction(
                     ActionType.RAISE,
@@ -271,8 +351,19 @@ class GameState:
         assert p == self.actor, f"Expected actor {self.actor}, got {p}"
         assert not self.folded[p] and not self.all_in[p]
 
+        # Record what the player was facing (observers see post-action state).
+        action.street = self.street
+        action.to_call = self.max_current_bet - self.current_bets[p]
+        action.pot_before = self.pot
+        action.bet_before = self.max_current_bet
+        action.committed_before = self.current_bets[p]
+        action.raises_before = self.raises_this_street
+        action.stack_before = self.stacks[p]
+
         self.action_history.append(action)
         self.num_actions_this_street += 1
+        full_raise = False
+        reopened = False
 
         if action.action_type == ActionType.FOLD:
             self.folded[p] = True
@@ -285,36 +376,47 @@ class GameState:
             self.stacks[p] -= amount
             self.pot += amount
             self.current_bets[p] += amount
+            action.amount = amount
             if self.stacks[p] == 0:
                 self.all_in[p] = True
 
         elif action.action_type in (ActionType.BET, ActionType.RAISE, ActionType.ALL_IN):
             total = action.amount  # total bet this street
             cost = total - self.current_bets[p]
-            cost = min(cost, self.stacks[p])
+            cost = max(0, min(cost, self.stacks[p]))
             actual_total = self.current_bets[p] + cost
             raise_increment = actual_total - self.max_current_bet
             if raise_increment > 0:
-                self.last_raise_size = raise_increment
+                reopened = True
+                self.raises_this_street += 1
                 self.last_raiser = p
+                # Only a complete raise resets the minimum-raise increment
+                # and re-opens betting for players who already acted.
+                if raise_increment >= self.last_raise_size or self.max_current_bet == 0:
+                    full_raise = True
+                    self.last_raise_size = max(raise_increment, self.big_blind)
             self.stacks[p] -= cost
             self.pot += cost
             self.current_bets[p] = actual_total
+            action.amount = actual_total
             if self.stacks[p] == 0:
                 self.all_in[p] = True
 
         # Remove current player from needs_to_act (they just acted)
         self.needs_to_act.discard(p)
 
-        # A raise/bet re-opens action for everyone else still in
-        if action.action_type in (ActionType.BET, ActionType.RAISE, ActionType.ALL_IN):
-            raise_increment = self.current_bets[p] - (self.max_current_bet
-                              if action.action_type == ActionType.ALL_IN
-                              else 0)
+        if reopened:
+            if full_raise:
+                self.cannot_reraise = set()
+                self.acted_since_full_raise = set()
+            else:
+                # Incomplete raise: those who already acted may only call/fold.
+                self.cannot_reraise |= (self.acted_since_full_raise - {p})
             # Everyone who can act (except the raiser) needs to respond
             for seat in self.players_can_act:
                 if seat != p:
                     self.needs_to_act.add(seat)
+        self.acted_since_full_raise.add(p)
 
         # Check if hand is over (only one active player left)
         if len(self.active_players) == 1:
@@ -346,6 +448,9 @@ class GameState:
         self.last_raiser = -1
         self.last_raise_size = self.big_blind
         self.num_actions_this_street = 0
+        self.raises_this_street = 0
+        self.acted_since_full_raise = set()
+        self.cannot_reraise = set()
 
         if self.street == Street.RIVER or len(self.players_can_act) <= 1:
             self.street = Street.SHOWDOWN
@@ -366,6 +471,48 @@ class GameState:
             self.hand_over = True
 
     # ------------------------------------------------------------------
+    # Per-seat view (what a bot is allowed to see)
+    # ------------------------------------------------------------------
+    def view_for(self, seat: Optional[int]) -> "GameState":
+        """Copy of the state with every other player's hole cards hidden.
+
+        The arena hands bots this view rather than the live object, so a bot
+        can neither read opponents' cards nor mutate the real game state
+        (design doc §23.1: reading other bots' hole cards off the server is
+        out of scope).  seat=None hides every hand (pure spectator view).
+        """
+        v = GameState(
+            num_players=self.num_players,
+            starting_stacks=list(self.starting_stacks),
+            small_blind=self.small_blind,
+            big_blind=self.big_blind,
+        )
+        v.stacks = list(self.stacks)
+        v.hole_cards = [
+            (list(h) if (i == seat and h is not None) else None)
+            for i, h in enumerate(self.hole_cards)
+        ]
+        v.board = list(self.board)
+        v.pot = self.pot
+        v.street = self.street
+        v.action_history = [copy.copy(a) for a in self.action_history]
+        v.positions = list(self.positions)
+        v.dealer_seat = self.dealer_seat
+        v.current_bets = list(self.current_bets)
+        v.folded = list(self.folded)
+        v.all_in = list(self.all_in)
+        v.actor = self.actor
+        v.last_raiser = self.last_raiser
+        v.last_raise_size = self.last_raise_size
+        v.num_actions_this_street = self.num_actions_this_street
+        v.hand_over = self.hand_over
+        v.needs_to_act = set(self.needs_to_act)
+        v.acted_since_full_raise = set(self.acted_since_full_raise)
+        v.cannot_reraise = set(self.cannot_reraise)
+        v.raises_this_street = self.raises_this_street
+        return v
+
+    # ------------------------------------------------------------------
     # State snapshot (for decision engine)
     # ------------------------------------------------------------------
     def snapshot(self, hero: int) -> dict:
@@ -381,7 +528,7 @@ class GameState:
             "current_bets": list(self.current_bets),
             "folded": list(self.folded),
             "all_in": list(self.all_in),
-            "spr": round(self.spr, 2) if self.pot > 0 else None,
+            "spr": round(self.spr_for(hero), 2) if self.pot > 0 else None,
             "action_history": [repr(a) for a in self.action_history],
             "legal_actions": [
                 (ActionType(la.action_type).name, la.min_amount, la.max_amount)

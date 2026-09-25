@@ -1,145 +1,173 @@
 """
-Strategy Controller
-===================
-Implements the randomized policy from Section 6 and the strategy
-controller from Section 18.
+Strategy Controller  (design doc §7, §21)
+=========================================
+Turns Q-values into a randomized action.
 
-The key insight: a deterministic policy (Equation 17) is exploitable.
-Instead, use softmax action selection (Equation 22):
+Corrections relative to the original softmax-with-floor policy:
 
-    P(a | s) = exp(Q(s,a) / τ) / Σ exp(Q(s,a') / τ)
-
-where τ controls exploration vs exploitation.
-
-Phase 2 implements:
-  - softmax action selection from Q-values
-  - temperature scheduling based on hand context
-  - basic strategy modes (balanced, value-heavy, aggressive)
-  - SPR-aware strategy adjustments
-
-Phase 3+ will add opponent-dependent strategy switching (Equations 63-68).
+* **Units.**  Q is in chips (or utility), so a fixed softmax temperature
+  behaves differently in a 15-chip pot and a 1,500-chip pot.  Q-values are
+  normalized by the utility value of the current pot before any
+  randomization, making the temperature dimensionless.
+* **No EV leakage.**  The old policy put at least 2% on *every* legal
+  action — including folding the nuts.  Now only actions within ε of the
+  best normalized Q are eligible; dominated actions get probability 0.
+* **Balance where it matters.**  At nodes where balance matters (a value
+  bet vs. check, or a bluff-catcher call vs. fold, with both options
+  near-optimal), the mix comes from regret matching (Eq. 18), not from a
+  temperature:
+        π_{t+1}(a) = R⁺_t(a) / Σ_a' R⁺_t(a'),  R_t(a) = Σ_τ (u_τ(a) − u_τ(π_τ))
+  with a uniform fallback when all regrets are non-positive.  Nodes are
+  abstracted by (street, facing a bet, hero strength decile, board
+  texture), so the mix is learned across the hands that share a spot.
+  Elsewhere a pot-normalized softmax over the near-optimal set is used.
+* **Modes are labels, not chip bonuses.**  A mode (value-heavy, aggressive,
+  trap-heavy …) is chosen from the opponent classification with hysteresis
+  (exploiter.py).  Its only direct effect here is a bounded tie-break among
+  near-optimal actions; the substantive exploitation already lives in the
+  EV (confidence-scaled q(B) from the MDF loop).  The old +3 / +5 chip
+  bonuses could override real EV differences of any size.
 """
 
 from __future__ import annotations
 import math
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Optional
 
-from game_state import GameState, ActionType, Action, Street, Position
+from game_state import GameState, ActionType, Action, Street
 from decision_engine import DecisionEngine, ActionEV, EVConfig
-from board_texture import analyze_board
+from hand_strength import hand_strength
+from opponent_model import texture_class
 
 
-# ---------------------------------------------------------------------------
-# Strategy modes (Section 18, Equation 63)
-# ---------------------------------------------------------------------------
 class StrategyMode(Enum):
-    BALANCED = auto()     # default: moderate temperature
-    VALUE_HEAVY = auto()  # lower temp, bias toward value bets
-    AGGRESSIVE = auto()   # boost bet/raise EV, bluff more
-    TRAP_HEAVY = auto()   # boost check/call EV for strong hands
-    TIGHT = auto()        # raise fold threshold, play fewer hands
+    BALANCED = auto()
+    VALUE_HEAVY = auto()
+    AGGRESSIVE = auto()
+    TRAP_HEAVY = auto()
+    TIGHT = auto()
 
 
-# ---------------------------------------------------------------------------
-# Strategy configuration
-# ---------------------------------------------------------------------------
+MODE_FROM_LABEL = {
+    "balanced": StrategyMode.BALANCED,
+    "value_heavy": StrategyMode.VALUE_HEAVY,
+    "aggressive": StrategyMode.AGGRESSIVE,
+    "trap_heavy": StrategyMode.TRAP_HEAVY,
+    "tight": StrategyMode.TIGHT,
+}
+
+# Tie-break preferences among near-optimal actions, in units of ε.
+MODE_TIEBREAK = {
+    StrategyMode.BALANCED: {},
+    StrategyMode.VALUE_HEAVY: {"bet": 0.5, "raise": 0.5},
+    StrategyMode.AGGRESSIVE: {"bet": 0.5, "raise": 0.5, "allin": 0.25},
+    StrategyMode.TRAP_HEAVY: {"check": 0.5, "call": 0.5},
+    StrategyMode.TIGHT: {"fold": 0.5, "check": 0.25},
+}
+
+
 @dataclass
 class StrategyConfig:
-    """Parameters for the strategy controller."""
-    # Base softmax temperature (Equation 22)
-    # τ → 0: greedy,  τ → ∞: uniform random
-    base_temperature: float = 8.0
+    # Candidate set: actions within ε·(pot utility) of the best Q.
+    near_optimal_epsilon: float = 0.05
+    # Softmax temperature on pot-normalized Q (dimensionless).
+    temperature: float = 0.02
+    # Use regret matching at balance nodes.
+    use_regret_matching: bool = True
+    # Only these streets are treated as balance nodes.
+    balance_streets: tuple = (Street.TURN, Street.RIVER)
 
-    # Temperature scaling
+    # --- Deprecated fields (accepted, not used) ------------------------
+    base_temperature: float = 8.0
     min_temperature: float = 1.0
     max_temperature: float = 30.0
-
-    # Temperature adjustments by context
-    river_temperature_scale: float = 0.6   # tighter play on river
-    preflop_temperature_scale: float = 1.3  # more varied preflop
-    large_pot_temperature_scale: float = 0.7  # tighter in big pots
-
-    # Large pot threshold (in BBs)
-    large_pot_bb: float = 20.0
-
-    # Minimum probability floor (prevent never folding/never raising)
-    min_action_probability: float = 0.02
-
-    # Strategy mode EV adjustments (in chips, added to Q-values)
-    mode_adjustments: dict = None
-
-    def __post_init__(self):
-        if self.mode_adjustments is None:
-            self.mode_adjustments = {
-                StrategyMode.BALANCED: {},
-                StrategyMode.VALUE_HEAVY: {
-                    ActionType.BET: 3.0,
-                    ActionType.RAISE: 3.0,
-                    ActionType.CALL: 1.0,
-                    ActionType.FOLD: -2.0,
-                },
-                StrategyMode.AGGRESSIVE: {
-                    ActionType.BET: 5.0,
-                    ActionType.RAISE: 5.0,
-                    ActionType.ALL_IN: 3.0,
-                    ActionType.CHECK: -3.0,
-                },
-                StrategyMode.TRAP_HEAVY: {
-                    ActionType.CHECK: 4.0,
-                    ActionType.CALL: 4.0,
-                    ActionType.BET: -2.0,
-                    ActionType.RAISE: -3.0,
-                },
-                StrategyMode.TIGHT: {
-                    ActionType.FOLD: 3.0,
-                    ActionType.CHECK: 1.0,
-                    ActionType.BET: -1.0,
-                },
-            }
+    min_action_probability: float = 0.0
+    mode_adjustments: Optional[dict] = None
 
 
 DEFAULT_STRATEGY_CONFIG = StrategyConfig()
 
 
-# ---------------------------------------------------------------------------
-# Action decision — what the controller returns
-# ---------------------------------------------------------------------------
 @dataclass
 class ActionDecision:
-    """Final action decision with probability distribution."""
     chosen_action: ActionEV
-    action_probabilities: list[tuple[str, float]]  # [(label, prob), ...]
-    temperature: float
+    action_probabilities: list[tuple[str, float]]
+    temperature: float            # effective temperature in utility units
     strategy_mode: StrategyMode
-    debug: dict = None
+    debug: dict = field(default_factory=dict)
+
+
+def action_kind(aev: ActionEV) -> str:
+    """Abstract action identity used by regret matching and tie-breaks."""
+    t = aev.action_type
+    if t == ActionType.FOLD:
+        return "fold"
+    if t == ActionType.CHECK:
+        return "check"
+    if t == ActionType.CALL:
+        return "call"
+    if t == ActionType.ALL_IN or "ALL_IN" in aev.label:
+        return "allin"
+    frac = aev.ev_components.get("bet_fraction_of_pot", 0.66)
+    base = "bet" if t == ActionType.BET else "raise"
+    return base + ("_small" if frac < 0.6 else "_big")
 
 
 # ---------------------------------------------------------------------------
-# Strategy Controller
+# Regret matching (Eq. 18)
+# ---------------------------------------------------------------------------
+class RegretMatcher:
+    """Regret matching over abstract nodes, with full-information updates."""
+
+    def __init__(self):
+        self.regret: dict[tuple, dict[str, float]] = {}
+        self.strategy_sum: dict[tuple, dict[str, float]] = {}
+        self.visits: dict[tuple, int] = {}
+
+    def strategy(self, node: tuple, actions: list[str]) -> dict[str, float]:
+        r = self.regret.get(node, {})
+        pos = {a: max(0.0, r.get(a, 0.0)) for a in actions}
+        s = sum(pos.values())
+        if s <= 0:
+            return {a: 1.0 / len(actions) for a in actions}
+        return {a: v / s for a, v in pos.items()}
+
+    def update(self, node: tuple, utilities: dict[str, float]):
+        """R(a) += u(a) − Σ_a' π(a') u(a')  for every action a at the node."""
+        actions = list(utilities)
+        pi = self.strategy(node, actions)
+        baseline = sum(pi[a] * utilities[a] for a in actions)
+        r = self.regret.setdefault(node, {})
+        for a in actions:
+            r[a] = r.get(a, 0.0) + utilities[a] - baseline
+        ss = self.strategy_sum.setdefault(node, {})
+        for a in actions:
+            ss[a] = ss.get(a, 0.0) + pi[a]
+        self.visits[node] = self.visits.get(node, 0) + 1
+
+    def average_strategy(self, node: tuple) -> dict[str, float]:
+        ss = self.strategy_sum.get(node, {})
+        s = sum(ss.values())
+        return {a: v / s for a, v in ss.items()} if s > 0 else {}
+
+
+# ---------------------------------------------------------------------------
+# Controller
 # ---------------------------------------------------------------------------
 class StrategyController:
-    """
-    Wraps the DecisionEngine with softmax randomization and strategy modes.
+    """DecisionEngine + near-optimal randomization + regret-matched balance."""
 
-    Usage:
-        controller = StrategyController()
-        decision = controller.decide(game_state, hero=0)
-        # decision.chosen_action is the ActionEV to execute
-    """
-
-    def __init__(
-        self,
-        ev_config: EVConfig = None,
-        strategy_config: StrategyConfig = None,
-        rng_seed: Optional[int] = None,
-    ):
-        self.engine = DecisionEngine(ev_config or EVConfig())
+    def __init__(self, ev_config: Optional[EVConfig] = None,
+                 strategy_config: Optional[StrategyConfig] = None,
+                 rng_seed: Optional[int] = None,
+                 likelihood_model=None):
+        self.engine = DecisionEngine(ev_config or EVConfig(), likelihood_model)
         self.config = strategy_config or DEFAULT_STRATEGY_CONFIG
         self._rng = random.Random(rng_seed)
         self._mode = StrategyMode.BALANCED
+        self.regrets = RegretMatcher()
 
     @property
     def mode(self) -> StrategyMode:
@@ -149,196 +177,108 @@ class StrategyController:
     def mode(self, value: StrategyMode):
         self._mode = value
 
-    def decide(
-        self,
-        gs: GameState,
-        hero: int,
-        mode: Optional[StrategyMode] = None,
-        opponent_ranges=None,
-        rng_seed=None,
-        exploit_profile=None,
-    ) -> ActionDecision:
-        """
-        Evaluate all actions, apply softmax randomization, return a decision.
-
-        Parameters
-        ----------
-        gs : current game state
-        hero : seat index of the bot
-        mode : override strategy mode (default: use self._mode)
-        opponent_ranges : optional ranges for Monte Carlo
-        rng_seed : seed for equity simulations (not for action selection)
-        exploit_profile : Phase 5 per-opponent exploit profile
-        """
+    # ------------------------------------------------------------------
+    def decide(self, gs: GameState, hero: int, mode: Optional[StrategyMode] = None,
+               opponent_ranges=None, rng_seed=None, exploit_profile=None,
+               **engine_kwargs) -> ActionDecision:
         active_mode = mode or self._mode
-
-        # --- 1. Get Q-values from decision engine ---
-        action_evs = self.engine.evaluate(
-            gs, hero, opponent_ranges, rng_seed,
-            exploit_profile=exploit_profile,
-        )
-        if not action_evs:
+        evs = self.engine.evaluate(gs, hero, opponent_ranges, rng_seed,
+                                   exploit_profile=exploit_profile, **engine_kwargs)
+        if not evs:
             dummy = ActionEV(ActionType.FOLD, 0, 0.0, {}, "Fold (forced)")
-            return ActionDecision(
-                chosen_action=dummy,
-                action_probabilities=[("Fold", 1.0)],
-                temperature=0.0,
-                strategy_mode=active_mode,
-            )
+            return ActionDecision(dummy, [("Fold", 1.0)], 0.0, active_mode)
 
-        # --- 2. Deduplicate: keep best EV per action type ---
-        best_per_type: dict[ActionType, ActionEV] = {}
-        for aev in action_evs:
-            at = aev.action_type
-            if at not in best_per_type or aev.ev > best_per_type[at].ev:
-                best_per_type[at] = aev
-        candidates = list(best_per_type.values())
+        scale = self._pot_scale(gs, hero, evs)
+        eps = self.config.near_optimal_epsilon
+        best = max(a.ev for a in evs) / scale
+        cands = [a for a in evs if a.ev / scale >= best - eps]
 
-        # --- 3. Apply strategy mode adjustments ---
-        adjusted_evs = []
-        mode_adj = self.config.mode_adjustments.get(active_mode, {})
-        for aev in candidates:
-            bonus = mode_adj.get(aev.action_type, 0.0)
-            adj_ev = aev.ev + bonus
-            adjusted_evs.append((aev, adj_ev))
+        # one representative (best EV) per abstract action kind
+        reps: dict[str, ActionEV] = {}
+        for a in cands:
+            k = action_kind(a)
+            if k not in reps or a.ev > reps[k].ev:
+                reps[k] = a
+        kinds = list(reps)
+        qn = {k: reps[k].ev / scale for k in kinds}
 
-        # --- 4. Compute temperature ---
-        temperature = self._compute_temperature(gs, hero)
-        # Phase 5: exploit profile temperature scaling
-        if exploit_profile and exploit_profile.confidence > 0.3:
-            temperature *= exploit_profile.temperature_scale
+        node = self._balance_node(gs, hero, kinds)
+        if node is not None and self.config.use_regret_matching and len(kinds) > 1:
+            pi = self.regrets.strategy(node, kinds)
+            self.regrets.update(node, qn)
+            method = "regret_matching"
+        else:
+            tb = MODE_TIEBREAK.get(active_mode, {})
+            logits = [qn[k] + eps * tb.get(k.split("_")[0], 0.0) for k in kinds]
+            probs = self._softmax(logits, self.config.temperature)
+            pi = dict(zip(kinds, probs))
+            method = "softmax_near_optimal"
 
-        # --- 5. Softmax (Equation 22) ---
-        probs = self._softmax(
-            [ev for _, ev in adjusted_evs],
-            temperature,
-        )
-
-        # --- 6. Apply minimum probability floor ---
-        probs = self._apply_floor(probs)
-
-        # --- 7. Sample an action ---
         roll = self._rng.random()
-        cumulative = 0.0
-        chosen_idx = len(probs) - 1
-        for i, p in enumerate(probs):
-            cumulative += p
-            if roll < cumulative:
-                chosen_idx = i
+        acc = 0.0
+        chosen_kind = kinds[-1]
+        for k in kinds:
+            acc += pi[k]
+            if roll < acc:
+                chosen_kind = k
                 break
+        chosen = reps[chosen_kind]
 
-        chosen = adjusted_evs[chosen_idx][0]
-
-        # Build probability report
-        action_probs = [
-            (adjusted_evs[i][0].label, round(probs[i], 3))
-            for i in range(len(probs))
-        ]
-        action_probs.sort(key=lambda x: x[1], reverse=True)
-
+        probs_report = sorted(((reps[k].label, round(pi[k], 3)) for k in kinds),
+                              key=lambda x: -x[1])
         return ActionDecision(
             chosen_action=chosen,
-            action_probabilities=action_probs,
-            temperature=round(temperature, 2),
+            action_probabilities=probs_report,
+            temperature=round(self.config.temperature * scale, 3),
             strategy_mode=active_mode,
             debug={
-                "raw_evs": [(aev.label, round(aev.ev, 1)) for aev in candidates],
-                "adjusted_evs": [
-                    (aev.label, round(adj, 1))
-                    for aev, adj in adjusted_evs
-                ],
-                "mode_bonuses": mode_adj,
+                "method": method,
+                "node": node,
+                "pot_scale": round(scale, 3),
+                "epsilon": eps,
+                "candidates": [(a.label, round(a.ev, 2)) for a in cands],
+                "raw_evs": [(a.label, round(a.ev, 2)) for a in evs],
+                "excluded": [a.label for a in evs if a not in cands],
             },
         )
 
     # ------------------------------------------------------------------
-    # Softmax
-    # ------------------------------------------------------------------
+    def _pot_scale(self, gs: GameState, hero: int, evs: list[ActionEV]) -> float:
+        """Utility value of the current pot (chips → the pot itself)."""
+        util = self.engine.utility
+        opps = [s for s in gs.active_players if s != hero]
+        ref = list(gs.starting_stacks) if gs.starting_stacks else list(gs.stacks)
+        ref[hero] = gs.stacks[hero]
+        s = util.pot_scale(gs.stacks[hero], max(gs.pot, gs.big_blind), hero, ref, opps)
+        return max(s, 1e-9)
+
+    def _balance_node(self, gs: GameState, hero: int, kinds: list[str]) -> Optional[tuple]:
+        """A spot where both an aggressive/continuing and a passive option are
+        near-optimal on a late street (value-bet vs check, call vs fold)."""
+        if gs.street not in self.config.balance_streets:
+            return None
+        ks = {k.split("_")[0] for k in kinds}
+        facing = gs.max_current_bet > gs.current_bets[hero]
+        if facing and not ({"call", "raise", "allin"} & ks and "fold" in ks):
+            return None
+        if not facing and not ({"bet", "allin"} & ks and "check" in ks):
+            return None
+        s = hand_strength(gs.hole_cards[hero], gs.board)
+        return (int(gs.street), facing, int(min(s, 0.999) * 10), texture_class(gs.board))
+
     @staticmethod
     def _softmax(values: list[float], temperature: float) -> list[float]:
-        """Compute softmax probabilities (Equation 22)."""
         if temperature <= 0:
-            # Greedy: all mass on max
-            max_val = max(values)
-            return [1.0 if v == max_val else 0.0 for v in values]
+            mx = max(values)
+            hits = [1.0 if v == mx else 0.0 for v in values]
+            s = sum(hits)
+            return [h / s for h in hits]
+        mx = max(values)
+        ex = [math.exp((v - mx) / temperature) for v in values]
+        s = sum(ex)
+        return [e / s for e in ex]
 
-        # Subtract max for numerical stability
-        max_v = max(values)
-        exps = [math.exp((v - max_v) / temperature) for v in values]
-        total = sum(exps)
-        if total == 0:
-            return [1.0 / len(values)] * len(values)
-        return [e / total for e in exps]
-
-    # ------------------------------------------------------------------
-    # Probability floor
-    # ------------------------------------------------------------------
-    def _apply_floor(self, probs: list[float]) -> list[float]:
-        """Ensure every action has at least min_action_probability."""
-        n = len(probs)
-        floor = self.config.min_action_probability
-        if n * floor >= 1.0:
-            return [1.0 / n] * n
-
-        result = list(probs)
-        deficit = 0.0
-        for i in range(n):
-            if result[i] < floor:
-                deficit += floor - result[i]
-                result[i] = floor
-
-        # Redistribute deficit from the largest probabilities
-        if deficit > 0:
-            above_floor = [(i, result[i]) for i in range(n) if result[i] > floor]
-            total_above = sum(p for _, p in above_floor)
-            if total_above > 0:
-                for i, p in above_floor:
-                    result[i] -= deficit * (p / total_above)
-
-        # Normalize
-        total = sum(result)
-        if total > 0:
-            result = [p / total for p in result]
-        return result
-
-    # ------------------------------------------------------------------
-    # Temperature scheduling
-    # ------------------------------------------------------------------
-    def _compute_temperature(self, gs: GameState, hero: int) -> float:
-        """
-        Adapt temperature to game context.
-        Lower temperature = more exploitative (greedy).
-        Higher temperature = more exploratory (balanced/unpredictable).
-        """
-        temp = self.config.base_temperature
-
-        # Street adjustment
-        if gs.street == Street.RIVER:
-            temp *= self.config.river_temperature_scale
-        elif gs.street == Street.PREFLOP:
-            temp *= self.config.preflop_temperature_scale
-
-        # Large pot → play tighter (lower temp)
-        pot_in_bb = gs.pot / gs.big_blind if gs.big_blind > 0 else 0
-        if pot_in_bb > self.config.large_pot_bb:
-            temp *= self.config.large_pot_temperature_scale
-
-        # Clamp
-        temp = max(self.config.min_temperature,
-                   min(self.config.max_temperature, temp))
-
-        return temp
-
-    # ------------------------------------------------------------------
-    # Convert decision to game Action
-    # ------------------------------------------------------------------
     @staticmethod
     def to_action(decision: ActionDecision, hero: int, street: Street) -> Action:
-        """Convert an ActionDecision into an Action for apply_action()."""
-        aev = decision.chosen_action
-        return Action(
-            player=hero,
-            action_type=aev.action_type,
-            amount=aev.amount,
-            street=street,
-        )
+        a = decision.chosen_action
+        return Action(player=hero, action_type=a.action_type, amount=a.amount, street=street)
